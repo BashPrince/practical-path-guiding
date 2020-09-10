@@ -145,6 +145,13 @@ std::pair<Texture *, Texture *> BSDF::ensureEnergyConservation(
 	return std::make_pair(tex1, tex2);
 }
 
+bool BSDF::add_parameters_to_proxy(BSDFProxy &bsdf_proxy, const BSDFSamplingRecord &bRec, bool &flipNormal) const
+{
+	// Default implementation returns parameterization not supported.
+	flipNormal = false;
+	return false;
+}
+
 static std::string typeMaskToString(unsigned int typeMask) {
 	std::ostringstream oss;
 	oss << "{ ";

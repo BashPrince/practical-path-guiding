@@ -17,6 +17,8 @@
 */
 
 #include <mitsuba/render/bsdf.h>
+#include <mitsuba/productguiding/bsdfproxy.h>
+
 #include <mitsuba/render/texture.h>
 #include <mitsuba/hw/gpuprogram.h>
 
@@ -213,6 +215,27 @@ public:
 
 	Float getEta() const {
 		return 1.0f;
+	}
+
+	bool add_parameters_to_proxy(BSDFProxy &bsdf_proxy,
+		const BSDFSamplingRecord &bRec, bool& flipNormal) const override
+	{
+		//bsdf_proxy.add_diffuse_weight(0.5f);
+		//return true;
+		BSDFSamplingRecord b(bRec);
+		if (b.wi.z > 0)
+		{
+			return m_nestedBRDF[0]->add_parameters_to_proxy(bsdf_proxy, b, flipNormal);
+			flipNormal = false;
+		}
+		else
+		{
+			b.wi.z *= -1;
+			b.wo.z *= -1;
+			const bool use_proxy = m_nestedBRDF[1]->add_parameters_to_proxy(bsdf_proxy, b, flipNormal);
+			flipNormal = true;
+			return use_proxy;
+		}
 	}
 
 	std::string toString() const {

@@ -34,6 +34,9 @@
 *.app
 
 # Other build artifacts
+/cmake_build
+/cmake_debug_build
+/visualizer/cmake_build
 /mitsuba/.sconf_temp
 /mitsuba/.sconsign.dblite
 /mitsuba/build/.vs
@@ -50,3 +53,7 @@
 
 *.vcxproj.user
 /.vscode
+
+* scenes and renders folders
+/scenes
+/renders

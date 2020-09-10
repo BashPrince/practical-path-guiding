@@ -192,6 +192,8 @@ public:
 	int sampledComponent;
 };
 
+// BSDFProxy forward declaration.
+class BSDFProxy;
 
 /**
  * \brief Abstract %BSDF base-class.
@@ -497,6 +499,13 @@ public:
 
 	//! @}
 	// =============================================================
+
+	/**
+     * Parameterize a BSDFProxy for product guiding. Return true if the underlying
+	 * BSDF type supports proxy parameterization and false otherwise.
+	 */
+	virtual bool add_parameters_to_proxy(BSDFProxy &bsdf_proxy,
+		const BSDFSamplingRecord &bRec, bool& flipNormal) const;
 
 	MTS_DECLARE_CLASS()
 protected:

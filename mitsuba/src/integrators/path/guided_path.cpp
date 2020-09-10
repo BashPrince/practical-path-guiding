@@ -21,6 +21,7 @@
 #include <mitsuba/render/scene.h>
 #include <mitsuba/core/plugin.h>
 #include <mitsuba/core/statistics.h>
+#include <mitsuba/productguiding/bsdfproxy.h>
 
 #include <array>
 #include <atomic>
@@ -63,6 +64,33 @@ static void addToAtomicFloat(std::atomic<Float>& var, Float val) {
 
 inline Float logistic(Float x) {
     return 1 / (1 + std::exp(-x));
+}
+
+inline Vector canonicalToDir(Point2 p)
+{
+    const Float cosTheta = 2 * p.x - 1;
+    const Float phi = 2 * M_PI * p.y;
+
+    const Float sinTheta = sqrt(1 - cosTheta * cosTheta);
+    Float sinPhi, cosPhi;
+    math::sincos(phi, &sinPhi, &cosPhi);
+
+    return {sinTheta * cosPhi, sinTheta * sinPhi, cosTheta};
+}
+
+inline Point2 dirToCanonical(const Vector &d)
+{
+    if (!std::isfinite(d.x) || !std::isfinite(d.y) || !std::isfinite(d.z))
+    {
+        return {0, 0};
+    }
+
+    const Float cosTheta = std::min(std::max(d.z, -1.0f), 1.0f);
+    Float phi = std::atan2(d.y, d.x);
+    while (phi < 0)
+        phi += 2.0 * M_PI;
+
+    return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
 }
 
 // Implements the stochastic-gradient-based Adam optimizer [Kingma and Ba 2014]
@@ -153,6 +181,73 @@ enum class ESpatialFilter {
 enum class EDirectionalFilter {
     ENearest,
     EBox,
+};
+
+class QuadTreeNode;
+
+class RadianceProxy
+{
+public:
+    RadianceProxy();
+
+    RadianceProxy(
+        const RadianceProxy &other);
+
+    void build(
+        const std::vector<QuadTreeNode> *quadtree_nodes,
+        const float radiance_scale);
+
+    void build_product(
+        BSDFProxy &bsdf_proxy,
+        const Vector3f &outgoing,
+        const Vector3f &shading_normal);
+    
+    void clear();
+
+    float proxy_radiance(
+        const Vector3f &direction) const;
+
+    float sample(
+        Sampler *sampler,
+        Vector3f &direction) const;
+
+    float pdf(
+        const Vector3f &direction) const;
+
+    bool is_built() const;
+
+    static const size_t ProxyWidth = 16;
+
+    alignas(32) std::array<float, ProxyWidth * ProxyWidth> m_map;
+
+    std::shared_ptr<
+        std::array<const QuadTreeNode *, ProxyWidth * ProxyWidth>>
+        m_quadtree_strata;
+
+    template <size_t Width>
+    class ImageImportanceSampler
+    {
+    public:
+        void build(std::array<float, Width * Width>)
+        {
+        }
+
+        float sample(const Point2 &s, Point2u &pixel) const
+        {
+            return 0.0;
+        }
+
+        float pdf(const Point2u &pixel) const
+        {
+            return 0.0;
+        }
+    };
+
+    ImageImportanceSampler<ProxyWidth> m_image_importance_sampler;
+
+    bool m_product_is_built;
+    bool m_is_built;
+    const std::vector<QuadTreeNode> *m_quadtree_nodes;
 };
 
 class QuadTreeNode {
@@ -365,11 +460,256 @@ public:
         }
     }
 
+    void build_radiance_proxy(
+        RadianceProxy & radiance_proxy,
+        const float radiance_factor,
+        const size_t end_level,
+        const std::vector<QuadTreeNode>* nodes,
+        const Point2u origin = Point2u(0, 0),
+        const size_t depth = 1) const
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            const Point2u sub_node_offset(i % 2, i >> 1);
+            if (depth == end_level || isLeaf(i))
+            {
+                // Write node i to map.
+                const size_t level_diff = end_level - depth;
+                size_t width = 1;
+                Point2u pixel_origin = (unsigned int)2 * origin + sub_node_offset;
+
+                for (size_t i = 0; i < level_diff; ++i)
+                {
+                    width *= 2;
+                    pixel_origin *= 2;
+                }
+
+                const float radiance = 4.0f * radiance_factor * sum(i);
+
+                for (size_t y = 0; y < width; ++y)
+                {
+                    for (size_t x = 0; x < width; ++x)
+                    {
+                        const Point2u pixel = pixel_origin + Point2u(x, y);
+                        const size_t pixel_index = pixel.y * RadianceProxy::ProxyWidth + pixel.x;
+
+                        assert(pixel_index >= 0);
+                        assert(pixel_index < RadianceProxy::ProxyWidth * RadianceProxy::ProxyWidth);
+                        radiance_proxy.m_map[pixel_index] = radiance;
+
+                        assert(radiance_proxy.m_quadtree_strata != nullptr);
+                        (*radiance_proxy.m_quadtree_strata)[pixel_index] = !isLeaf(i) ? &((*nodes)[child(i)]) : nullptr;
+                    }
+                }
+            }
+            else
+            {
+                // Recursively write node i's children to map.
+                const Point2u sub_node_origin = (unsigned int)2 * origin + sub_node_offset;
+                (*nodes)[child(i)].build_radiance_proxy(
+                    radiance_proxy,
+                    radiance_factor * 4.0f,
+                    end_level,
+                    nodes,
+                    sub_node_origin,
+                    depth + 1);
+            }
+        }
+    }
+
+    float radiance(Point2& dir, const std::vector<QuadTreeNode>& nodes) const
+    {
+        const int index = childIndex(dir);
+        if (isLeaf(index))
+        {
+            return 4 * sum(index);
+        }
+        else
+        {
+            return 4 * nodes[child(index)].radiance(dir, nodes);
+        }
+    }
+
 private:
     std::array<std::atomic<Float>, 4> m_sum;
     std::array<uint16_t, 4> m_children;
 };
 
+RadianceProxy::RadianceProxy()
+    : m_product_is_built(false)
+    , m_is_built(false)
+    , m_quadtree_nodes(nullptr)
+{}
+
+RadianceProxy::RadianceProxy(
+    const RadianceProxy&                    other)
+    : m_map(other.m_map)
+    , m_quadtree_strata(other.m_quadtree_strata)
+    , m_product_is_built(false)
+    , m_is_built(other.m_is_built)
+    , m_quadtree_nodes(other.m_quadtree_nodes)
+{}
+
+void RadianceProxy::build(
+    const std::vector<QuadTreeNode>* quadtree_nodes,
+    const float radiance_scale)
+{
+    m_quadtree_nodes = quadtree_nodes;
+    m_quadtree_strata = std::make_shared<std::array<const QuadTreeNode *, ProxyWidth * ProxyWidth>>();
+
+    size_t end_level = 0;
+    size_t map_width = ProxyWidth;
+
+    while (map_width > 1)
+    {
+        ++end_level;
+        map_width = map_width >> 1;
+    }
+
+    (*m_quadtree_nodes)[0].build_radiance_proxy(
+        (*this),
+        radiance_scale,
+        end_level,
+        m_quadtree_nodes);
+
+    for (float &pixel_val : m_map)
+    {
+        if (pixel_val < 0.0f || std::isnan(pixel_val) || std::isinf(pixel_val))
+            pixel_val = 0.0f;
+    }
+
+    m_is_built = true;
+}
+
+void RadianceProxy::build_product(
+    BSDFProxy &bsdf_proxy,
+    const Vector3f &outgoing,
+    const Vector3f &shading_normal)
+{
+    assert(m_is_built);
+
+    if (m_product_is_built)
+        return;
+
+    bsdf_proxy.finish_parameterization(outgoing, shading_normal);
+    m_product_is_built = true;
+
+    const float inv_width = 1.0f / ProxyWidth;
+    for (size_t y = 0; y < ProxyWidth; ++y)
+    {
+        for (size_t x = 0; x < ProxyWidth; ++x)
+        {
+            const Point2u pixel(x, y);
+            const Point2f cylindrical_direction(
+                (x + 0.5f) * inv_width,
+                (y + 0.5f) * inv_width);
+
+            const Vector3f incoming = canonicalToDir(cylindrical_direction);
+
+            const size_t index = pixel.y * ProxyWidth + pixel.x;
+            m_map[index] *= bsdf_proxy.evaluate(incoming);
+        }
+    }
+
+    m_image_importance_sampler.build(m_map);
+}
+
+void RadianceProxy::clear()
+{
+    m_is_built = false;
+    m_product_is_built = false;
+    m_quadtree_nodes = nullptr;
+}
+
+float RadianceProxy::proxy_radiance(
+    const Vector3f &direction) const
+{
+    const Point2f spherical_direction(dirToCanonical(direction) * static_cast<float>(ProxyWidth));
+    const Point2u pixel(
+        std::min(static_cast<size_t>(spherical_direction.x), ProxyWidth - 1),
+        std::min(static_cast<size_t>(spherical_direction.y), ProxyWidth - 1));
+
+    return m_map[pixel.y * ProxyWidth + pixel.x];
+}
+
+float RadianceProxy::sample(
+    Sampler *sampler,
+    Vector3f &direction) const
+{
+    assert(m_is_built);
+    // Sample the importance map.
+    Point2f s = sampler->next2D();
+    Point2u pixel;
+    float pdf = m_image_importance_sampler.sample(s, pixel);
+    assert(pdf >= 0.0f);
+
+    Point2f cylindrical_direction(pixel.x, pixel.y);
+
+    assert(m_quadtree_strata != nullptr);
+    assert(m_quadtree_strata->size() == ProxyWidth * ProxyWidth);
+    assert(pixel.y * ProxyWidth + pixel.x < ProxyWidth * ProxyWidth && pixel.y * ProxyWidth + pixel.x >= 0);
+    const QuadTreeNode *sub_tree = (*m_quadtree_strata)[pixel.y * ProxyWidth + pixel.x];
+
+    if (sub_tree)
+    {
+        assert(m_quadtree_nodes != nullptr);
+        float tree_pdf;
+        cylindrical_direction += sub_tree->sample(sampler, *m_quadtree_nodes);
+        pdf *= tree_pdf;
+    }
+    else
+    {
+        cylindrical_direction += s;
+    }
+
+    pdf *= ProxyWidth * ProxyWidth * INV_FOURPI;
+    cylindrical_direction *= 1.0f / ProxyWidth;
+    // assert(cylindrical_direction.x >= 0.0f && cylindrical_direction.x < 1.0f);
+    // assert(cylindrical_direction.y >= 0.0f && cylindrical_direction.y < 1.0f);
+    cylindrical_direction.x = std::max(std::min(cylindrical_direction.x, 0.99999f), 0.0f);
+    cylindrical_direction.y = std::max(std::min(cylindrical_direction.y, 0.99999f), 0.0f);
+    direction = canonicalToDir(cylindrical_direction);
+
+    return pdf;
+}
+
+float RadianceProxy::pdf(
+    const Vector3f &direction) const
+{
+    assert(m_is_built);
+
+    const Point2f cylindrical_direction = dirToCanonical(direction) * static_cast<float>(ProxyWidth);
+    Point2u pixel(cylindrical_direction.x, cylindrical_direction.y);
+
+    pixel.x = std::min(pixel.x, static_cast<unsigned int>(ProxyWidth - 1));
+    pixel.y = std::min(pixel.y, static_cast<unsigned int>(ProxyWidth - 1));
+
+    // TODO: More precise mapping between directions and map pixels to avoid discrepancies in sampled
+    // and evaluated pdf values. There also seems to be another source causing these discrepancies.
+
+    float pdf = m_image_importance_sampler.pdf(pixel);
+
+    assert(m_quadtree_strata != nullptr);
+    assert(m_quadtree_strata->size() == ProxyWidth * ProxyWidth);
+    assert(pixel.y * ProxyWidth + pixel.x >= 0);
+    assert(pixel.y * ProxyWidth + pixel.x < ProxyWidth * ProxyWidth);
+    const QuadTreeNode *sub_tree = (*m_quadtree_strata)[pixel.y * ProxyWidth + pixel.x];
+
+    if (sub_tree)
+    {
+        assert(m_quadtree_nodes != nullptr);
+        Point2f sub_direction(cylindrical_direction.x - pixel.x, cylindrical_direction.y - pixel.y);
+        pdf *= sub_tree->pdf(sub_direction, *m_quadtree_nodes);
+    }
+
+    pdf *= ProxyWidth * ProxyWidth * INV_FOURPI;
+    return pdf;
+}
+
+bool RadianceProxy::is_built() const
+{
+    return m_is_built;
+}
 
 class DTree {
 public:
@@ -532,6 +872,26 @@ public:
         m_atomic.sum.store(sum);
     }
 
+    void buildRadianceProxy(RadianceProxy& radianceProxy)
+    {
+        const float statisticalWeight = m_atomic.statisticalWeight.load();
+        const float sum = m_atomic.sum.load();
+
+        if (sum > 0.0f && statisticalWeight > 0.0f)
+            radianceProxy.build(&m_nodes, INV_FOURPI / statisticalWeight);
+        else
+            radianceProxy.clear();
+    }
+
+    float radiance(Vector& dir) const
+    {
+        if (m_atomic.sum.load() <= 0.0f || m_atomic.statisticalWeight.load() <= 0.0)
+            return 0.0f;
+
+        Point2 cylindrical_direction = dirToCanonical(dir);
+        return m_nodes[0].radiance(cylindrical_direction, m_nodes) / (4.0f * M_PI * m_atomic.statisticalWeight.load());
+    }
+
 private:
     std::vector<QuadTreeNode> m_nodes;
 
@@ -583,33 +943,10 @@ public:
         }
     }
 
-    static Vector canonicalToDir(Point2 p) {
-        const Float cosTheta = 2 * p.x - 1;
-        const Float phi = 2 * M_PI * p.y;
-
-        const Float sinTheta = sqrt(1 - cosTheta * cosTheta);
-        Float sinPhi, cosPhi;
-        math::sincos(phi, &sinPhi, &cosPhi);
-
-        return {sinTheta * cosPhi, sinTheta * sinPhi, cosTheta};
-    }
-
-    static Point2 dirToCanonical(const Vector& d) {
-        if (!std::isfinite(d.x) || !std::isfinite(d.y) || !std::isfinite(d.z)) {
-            return {0, 0};
-        }
-
-        const Float cosTheta = std::min(std::max(d.z, -1.0f), 1.0f);
-        Float phi = std::atan2(d.y, d.x);
-        while (phi < 0)
-            phi += 2.0 * M_PI;
-
-        return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
-    }
-
     void build() {
         building.build();
         sampling = building;
+        sampling.buildRadianceProxy(radianceProxy);
     }
 
     void reset(int maxDepth, Float subdivisionThreshold) {
@@ -710,11 +1047,23 @@ public:
         }
     }
 
+    const RadianceProxy& getRadianceProxy() const
+    {
+        return radianceProxy;
+    }
+
+    float radiance(Vector& dir) const
+    {
+        return sampling.radiance(dir);
+    }
+
 private:
     DTree building;
     DTree sampling;
 
     AdamOptimizer bsdfSamplingFractionOptimizer{0.01f};
+
+    RadianceProxy radianceProxy;
 
     class SpinLock {
     public:
@@ -1789,13 +2138,20 @@ public:
         int nVertices = 0;
 
         auto recordRadiance = [&](Spectrum radiance) {
-            Li += radiance;
-            for (int i = 0; i < nVertices; ++i) {
+            //if (!(m_isFinalIter && rRec.depth <= 1))
+                Li += radiance;
+
+            for (int i = 0; i < nVertices; ++i)
+            {
                 vertices[i].record(radiance);
             }
         };
 
-        while (rRec.depth <= m_maxDepth || m_maxDepth < 0) {
+        // Only render indirect
+        // rRec.type = RadianceQueryRecord::ESubsurfaceRadiance;
+
+        while (rRec.depth <= m_maxDepth || m_maxDepth < 0)
+        {
 
             /* ==================================================================== */
             /*                 Radiative Transfer Equation sampling                 */
@@ -1957,6 +2313,53 @@ public:
                 Float woPdf, bsdfPdf, dTreePdf;
                 Spectrum bsdfWeight = sampleMat(bsdf, bRec, woPdf, bsdfPdf, dTreePdf, bsdfSamplingFraction, rRec, dTree);
 
+                // Visualize RadianceProxy
+                if (m_isFinalIter && dTree)
+                {
+                    RadianceProxy radianceProxy(dTree->getRadianceProxy());
+                    if (radianceProxy.is_built())
+                    {
+                        const Vector n = its.shFrame.n;
+                        const Vector dir = bRec.its.toWorld(bRec.wo);
+                        const float radiance = radianceProxy.proxy_radiance(dir);
+                        // const float radiance = dTree->radiance(dir);
+                        BSDFProxy bsdfProxy;
+                        bool flipNormal;
+                        const bool useBsdfProxy = bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
+                        Spectrum Li;
+                        if (useBsdfProxy)
+                        {
+                            bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), flipNormal ? -n : n);
+                            const float bsdfVal = woPdf == 0 ? 0.0f : bsdfProxy.evaluate(dir) / woPdf;
+                            Li = (radiance * bsdfVal) * throughput;
+
+                            // if (Li.average() > 2.5f)
+                            // {
+                            //     bsdfProxy.evaluate(dir);
+                            // }
+                        }
+                        else
+                        {
+                            // Li = radiance * bsdfWeight * throughput;
+                            Li = radiance * bsdfWeight.average() * throughput;
+                        }
+
+                        return Li;
+                    }
+                    else
+                    {
+                        Spectrum Li;
+                        Li.fromLinearRGB(0.0f, 0.0f, 1.0f);
+                        return Li;
+                    }
+                }
+                else if (m_isFinalIter && !dTree)
+                {
+                    Spectrum Li;
+                    Li.fromLinearRGB(1.0f, 1.0f, 0.0f);
+                    return Li;
+                }
+
                 /* ==================================================================== */
                 /*                          Luminaire sampling                          */
                 /* ==================================================================== */
@@ -2014,7 +2417,7 @@ public:
                                     v.commit(*m_sdTree, 0.5f, m_spatialFilter, m_directionalFilter, m_isBuilt ? m_bsdfSamplingFractionLoss : EBsdfSamplingFractionLoss::ENone, rRec.sampler);
                                 }
                             }
-
+                            
                             recordRadiance(L);
                         }
                     }

@@ -17,6 +17,7 @@
 */
 
 #include <mitsuba/render/bsdf.h>
+#include <mitsuba/productguiding/bsdfproxy.h>
 #include <mitsuba/render/sampler.h>
 #include <mitsuba/hw/basicshader.h>
 #include "microfacet.h"
@@ -640,6 +641,19 @@ public:
 	Float getRoughness(const Intersection &its, int component) const {
 		return 0.5f * (m_alphaU->eval(its).average()
 			+ m_alphaV->eval(its).average());
+	}
+
+	bool add_parameters_to_proxy(BSDFProxy &bsdf_proxy,
+		const BSDFSamplingRecord &bRec, bool& flipNormal) const override
+	{
+		flipNormal = false;
+		const float alpha = std::max(m_alphaU->eval(bRec.its).average(), m_alphaV->eval(bRec.its).average());
+		const float avg_specular_reflectance = m_specularReflectance->eval(bRec.its).average();
+		const float avg_specular_transmittance = m_specularTransmittance->eval(bRec.its).average();
+		bsdf_proxy.add_reflection_weight(avg_specular_reflectance, alpha);
+		bsdf_proxy.add_refraction_weight(avg_specular_transmittance, alpha, m_eta);
+
+		return true;
 	}
 
 	std::string toString() const {

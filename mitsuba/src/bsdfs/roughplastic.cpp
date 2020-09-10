@@ -17,6 +17,7 @@
 */
 
 #include <mitsuba/render/bsdf.h>
+#include <mitsuba/productguiding/bsdfproxy.h>
 #include <mitsuba/hw/basicshader.h>
 #include <mitsuba/core/warp.h>
 #include "microfacet.h"
@@ -527,6 +528,16 @@ public:
 			return m_alpha->eval(its).average();
 		else
 			return std::numeric_limits<Float>::infinity();
+	}
+
+	bool add_parameters_to_proxy(BSDFProxy &bsdf_proxy,
+		const BSDFSamplingRecord &bRec, bool& flipNormal) const override
+	{
+		flipNormal = false;
+		const float alpha = m_alpha->eval(bRec.its).average();
+		bsdf_proxy.add_reflection_weight(m_specularReflectance->eval(bRec.its).average(), alpha);
+		bsdf_proxy.add_diffuse_weight(m_diffuseReflectance->eval(bRec.its).average() * INV_PI);
+		return true;
 	}
 
 	std::string toString() const {
