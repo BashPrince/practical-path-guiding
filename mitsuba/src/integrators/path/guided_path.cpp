@@ -22,6 +22,7 @@
 #include <mitsuba/core/plugin.h>
 #include <mitsuba/core/statistics.h>
 #include <mitsuba/productguiding/bsdfproxy.h>
+#include <mitsuba/core/warp.h>
 
 #include <array>
 #include <atomic>
@@ -185,6 +186,25 @@ enum class EDirectionalFilter {
 
 class QuadTreeNode;
 
+template <typename Predicate>
+int FindInterval(int size, const Predicate &pred)
+{
+    int first = 0, len = size;
+    while (len > 0)
+    {
+        int half = len >> 1, middle = first + half;
+        // Bisect range based on value of _pred_ at _middle_
+        if (pred(middle))
+        {
+            first = middle + 1;
+            len -= half + 1;
+        }
+        else
+            len = half;
+    }
+    return math::clamp(first - 1, 0, size - 2);
+}
+
 class RadianceProxy
 {
 public:
@@ -228,19 +248,97 @@ public:
     class ImageImportanceSampler
     {
     public:
-        void build(std::array<float, Width * Width>)
+        void build(std::array<float, Width * Width>& func)
         {
+            float marginalSum = 0.0f;
+
+            for (size_t y = 0; y < Width; ++y)
+            {
+                std::array<float, Width>& conditionalDistribution = conditionalDistributions[y];
+                float sum = 0.0f;
+
+                for (size_t x = 0; x < Width; ++x)
+                {
+                    const size_t index = y * Width + x;
+                    if (func[index] > 0.0f)
+                        sum += func[index];
+                    conditionalDistribution[x] = sum;
+                }
+                const float invSum = sum <= 0.0f ? 0.0f : 1.0f / sum;
+                for (auto& c : conditionalDistribution)
+                    c *= invSum;
+                
+                conditionalDistribution[Width - 1] = 1.0f;
+                
+                marginalSum += sum;
+                marginalDistribution[y] = marginalSum;
+            }
+
+            const float invMarginalSum = marginalSum <= 0.0f ? 0.0f : 1.0f / marginalSum;
+            for (auto& m : marginalDistribution)
+                m *= invMarginalSum;
+
+            marginalDistribution[Width - 1] = 1.0f;
+
+            if (marginalSum <= 0.0f)
+            {
+                isZero = true;
+            }
+            else
+            {
+                for (size_t y = 0; y < Width; ++y)
+                    for (size_t x = 0; x < Width; ++x)
+                    {
+                        const size_t index = y * Width + x;
+                        discretePdf[index] = func[index] * invMarginalSum;
+                    }
+            }
         }
 
         float sample(const Point2 &s, Point2u &pixel) const
         {
-            return 0.0;
+            if (isZero)
+            {
+                pixel.x = (unsigned int)(s.x * Width);
+                pixel.y = (unsigned int)(s.y * Width);
+                return 1.0f / (Width * Width);
+            }
+
+            size_t y = 0;
+            while (s.y > marginalDistribution[y])
+                ++y;
+
+            assert(y < Width);
+            const std::array<float, Width> &conditionalDistribution = conditionalDistributions[y];
+
+            size_t x = 0;
+            while (s.x > conditionalDistribution[x])
+                ++x;
+            
+
+            const size_t index = y * Width + x;
+            pixel.x = x;
+            pixel.y = y;
+            return discretePdf[index];
         }
 
         float pdf(const Point2u &pixel) const
         {
-            return 0.0;
+            if (isZero)
+                return 1.0f / (Width * Width);
+            
+            assert(pixel.x < ProxyWidth);
+            assert(pixel.y < ProxyWidth);
+
+            const size_t index = pixel.y * Width + pixel.x;
+            return discretePdf[index];
         }
+
+    private:
+        std::array<float, Width> marginalDistribution;
+        std::array<std::array<float, Width>, Width> conditionalDistributions;
+        std::array<float, Width * Width> discretePdf;
+        bool isZero = false;
     };
 
     ImageImportanceSampler<ProxyWidth> m_image_importance_sampler;
@@ -610,7 +708,7 @@ void RadianceProxy::build_product(
             m_map[index] *= bsdf_proxy.evaluate(incoming);
         }
     }
-
+    // Build discrete 2D distribution
     m_image_importance_sampler.build(m_map);
 }
 
@@ -640,6 +738,7 @@ float RadianceProxy::sample(
     // Sample the importance map.
     Point2f s = sampler->next2D();
     Point2u pixel;
+
     float pdf = m_image_importance_sampler.sample(s, pixel);
     assert(pdf >= 0.0f);
 
@@ -653,12 +752,15 @@ float RadianceProxy::sample(
     if (sub_tree)
     {
         assert(m_quadtree_nodes != nullptr);
-        float tree_pdf;
-        cylindrical_direction += sub_tree->sample(sampler, *m_quadtree_nodes);
+        const Point2 sub_direction = sub_tree->sample(sampler, *m_quadtree_nodes);
+        Point2 sub_direction_pdf_eval = sub_direction;
+        const float tree_pdf = sub_tree->pdf(sub_direction_pdf_eval, *m_quadtree_nodes);
+        cylindrical_direction += sub_direction;
         pdf *= tree_pdf;
     }
     else
     {
+        s = sampler->next2D();
         cylindrical_direction += s;
     }
 
@@ -678,8 +780,9 @@ float RadianceProxy::pdf(
 {
     assert(m_is_built);
 
-    const Point2f cylindrical_direction = dirToCanonical(direction) * static_cast<float>(ProxyWidth);
-    Point2u pixel(cylindrical_direction.x, cylindrical_direction.y);
+    const Point2f cylindrical_direction = dirToCanonical(direction);
+    const Point2f cylindrical_direction_scaled = cylindrical_direction * static_cast<float>(ProxyWidth);
+    Point2u pixel(cylindrical_direction_scaled.x, cylindrical_direction_scaled.y);
 
     pixel.x = std::min(pixel.x, static_cast<unsigned int>(ProxyWidth - 1));
     pixel.y = std::min(pixel.y, static_cast<unsigned int>(ProxyWidth - 1));
@@ -698,7 +801,7 @@ float RadianceProxy::pdf(
     if (sub_tree)
     {
         assert(m_quadtree_nodes != nullptr);
-        Point2f sub_direction(cylindrical_direction.x - pixel.x, cylindrical_direction.y - pixel.y);
+        Point2f sub_direction(cylindrical_direction_scaled.x - pixel.x, cylindrical_direction_scaled.y - pixel.y);
         pdf *= sub_tree->pdf(sub_direction, *m_quadtree_nodes);
     }
 
@@ -946,11 +1049,11 @@ public:
     void build() {
         building.build();
         sampling = building;
-        sampling.buildRadianceProxy(radianceProxy);
     }
 
     void reset(int maxDepth, Float subdivisionThreshold) {
         building.reset(sampling, maxDepth, subdivisionThreshold);
+        sampling.buildRadianceProxy(radianceProxy);
     }
 
     Vector sample(Sampler* sampler) const {
@@ -2329,19 +2432,24 @@ public:
                         Spectrum Li;
                         if (useBsdfProxy)
                         {
-                            bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), flipNormal ? -n : n);
-                            const float bsdfVal = woPdf == 0 ? 0.0f : bsdfProxy.evaluate(dir) / woPdf;
-                            Li = (radiance * bsdfVal) * throughput;
 
-                            // if (Li.average() > 2.5f)
-                            // {
-                            //     bsdfProxy.evaluate(dir);
-                            // }
+                            // bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), flipNormal ? -n : n);
+                            // const float bsdfVal = woPdf == 0 ? 0.0f : bsdfProxy.evaluate(dir) / woPdf;
+                            // Li = (radiance * bsdfVal) * throughput;
+
+                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), flipNormal ? -n : n);
+                            Vector wo;
+                            const float productPdf = radianceProxy.sample(rRec.sampler, wo);
+                            const float product = productPdf == 0 ? 0.0f : radianceProxy.proxy_radiance(wo) / productPdf;
+                            Li = product * throughput;
                         }
                         else
                         {
                             // Li = radiance * bsdfWeight * throughput;
-                            Li = radiance * bsdfWeight.average() * throughput;
+                            // Li = radiance * bsdfWeight.average() * throughput;
+                            Spectrum Li;
+                            Li.fromLinearRGB(0.0f, 1.0f, 1.0f);
+                            return Li;
                         }
 
                         return Li;

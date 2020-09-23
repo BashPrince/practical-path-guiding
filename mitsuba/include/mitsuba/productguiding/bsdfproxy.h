@@ -42,14 +42,14 @@ class BSDFProxy
     void add_refraction_weight(
         const float refraction_weight,
         const float roughness,
-        const float ior)
+        const float eta)
     {
         const float old_weight = m_refraction_weight;
         m_refraction_weight += refraction_weight;
         const float inv_weight = m_refraction_weight > 0.0f ? 1.0f / m_refraction_weight : 0.0f;
         m_refraction_roughness = old_weight * inv_weight * m_refraction_roughness + refraction_weight * inv_weight * roughness;
 
-        m_IOR = ior; // TO-DO: handle appropriately
+        m_eta = eta; // TO-DO: handle appropriately
     }
 
     void finish_parameterization(
@@ -68,14 +68,26 @@ class BSDFProxy
         // TO-DO: Hemisphere checks, basic asserts.
         m_normal = shading_normal;
         m_reflection_lobe = reflect(outgoing, m_normal);
-        m_refraction_lobe = refract(outgoing, m_normal, m_IOR);
+        m_refraction_lobe = refract(outgoing, m_normal, m_eta);
 
         // Roughness correction.
         m_reflection_roughness *= 2.0f;
         const float cos_nt = std::abs(dot(m_normal, m_refraction_lobe));
         const float cos_no = std::abs(dot(m_normal, outgoing));
-        const float scale_factor_refraction = (cos_nt + m_IOR * cos_no) / cos_nt;
+        const float scale_factor_refraction = (cos_nt + m_eta * cos_no) / cos_nt;
         m_refraction_roughness *= scale_factor_refraction;
+    }
+
+    float ggx_lobe_incoming(const float cos_lobe_in, const float weight, const float alpha) const
+    {
+        const float cos2_lobe_in = cos_lobe_in * cos_lobe_in;
+        const float sin2_lobe_in = 1.0f - cos2_lobe_in;
+        const float alpha2 = alpha * alpha;
+
+        float factor = cos2_lobe_in + sin2_lobe_in / alpha2;
+        factor *= factor;
+        factor *= M_PI * alpha2;
+        return factor = 0.0f ? 0.0f : weight / factor;
     }
 
     float evaluate(
@@ -99,30 +111,16 @@ class BSDFProxy
 
             if (cos_refl_i > 0.0f)
             {
-                const float cos2_refl_i = cos_refl_i * cos_refl_i;
-                const float sin2_refl_i = 1.0f - cos2_refl_i;
-                const float alpha2 = m_reflection_roughness * m_reflection_roughness;
-
-                float factor = cos2_refl_i + sin2_refl_i / alpha2;
-                factor *= factor;
-                factor *= M_PI * alpha2;
-                value += factor = 0.0f ? 0.0f : m_reflection_weight / factor;
+                value += ggx_lobe_incoming(cos_refl_i, m_reflection_weight, m_reflection_roughness);
             }
         }
-        if (m_is_refractive && cos_negni > 0.0f)
+        if (m_is_refractive)
         {
             const float cos_refr_i = dot(m_refraction_lobe, incoming);
 
-            if (cos_refr_i > 0.0f)
+            if (cos_refr_i > 0.0f && dot(m_refraction_lobe, m_normal) * dot(incoming, m_normal) > 0.0001f)
             {
-                const float cos2_refr_i = cos_refr_i * cos_refr_i;
-                const float sin2_refr_i = 1.0f - cos2_refr_i;
-                const float alpha2 = m_refraction_roughness * m_refraction_roughness;
-
-                float factor = cos2_refr_i + sin2_refr_i / alpha2;
-                factor *= factor;
-                factor *= M_PI * alpha2;
-                value += factor = 0.0f ? 0.0f : m_refraction_weight / factor;
+                value += ggx_lobe_incoming(cos_refr_i, m_refraction_weight, m_refraction_roughness);
             }
         }
 
@@ -140,7 +138,7 @@ class BSDFProxy
 private:
     float m_diffuse_weight, m_reflection_weight, m_refraction_weight, m_translucency_weight;
     float m_reflection_roughness, m_refraction_roughness;
-    float m_IOR;
+    float m_eta;
     bool m_is_diffuse, m_is_translucent, m_is_reflective, m_is_refractive;
 
     Vector3f m_normal;
