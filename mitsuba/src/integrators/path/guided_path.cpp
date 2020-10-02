@@ -103,6 +103,7 @@ public:
 
     AdamOptimizer& operator=(const AdamOptimizer& arg) {
         m_state = arg.m_state;
+        m_product_state = arg.m_product_state;
         m_hparams = arg.m_hparams;
         return *this;
     }
@@ -123,6 +124,18 @@ public:
         }
     }
 
+    void append_product(Vector2 gradient, Float statisticalWeight) {
+        m_product_state.batchGradient += gradient * statisticalWeight;
+        m_product_state.batchAccumulation += statisticalWeight;
+
+        if (m_product_state.batchAccumulation > m_hparams.batchSize) {
+            step_product(m_product_state.batchGradient / m_product_state.batchAccumulation);
+
+            m_product_state.batchGradient = Vector2(0.0f);
+            m_product_state.batchAccumulation = 0;
+        }
+    }
+
     void step(Float gradient) {
         ++m_state.iter;
 
@@ -137,8 +150,29 @@ public:
         m_state.variable = std::min(std::max(m_state.variable, -20.0f), 20.0f);
     }
 
+    void step_product(Vector2 gradient) {
+        ++m_product_state.iter;
+
+        Float actualLearningRate = m_hparams.learningRate * std::sqrt(1 - std::pow(m_hparams.beta2, m_product_state.iter)) / (1 - std::pow(m_hparams.beta1, m_product_state.iter));
+        m_product_state.firstMoment = m_hparams.beta1 * m_product_state.firstMoment + (1 - m_hparams.beta1) * gradient;
+        m_product_state.secondMoment = m_hparams.beta2 * m_product_state.secondMoment + (1 - m_hparams.beta2) * Vector2(gradient.x * gradient.x, gradient.y + gradient.y);
+        m_product_state.variable.x -= actualLearningRate * m_product_state.firstMoment.x / (std::sqrt(m_product_state.secondMoment.x) + m_hparams.epsilon);
+        m_product_state.variable.y -= actualLearningRate * m_product_state.firstMoment.y / (std::sqrt(m_product_state.secondMoment.y) + m_hparams.epsilon);
+
+        // Clamp the variable to the range [-20, 20] as a safeguard to avoid numerical instability:
+        // since the sigmoid involves the exponential of the variable, value of -20 or 20 already yield
+        // in *extremely* small and large results that are pretty much never necessary in practice.
+        m_product_state.variable = Vector2(
+            math::clamp(m_product_state.variable.x, -20.0f, 20.0f),
+            math::clamp(m_product_state.variable.y, -20.0f, 20.0f));
+    }
+
     Float variable() const {
         return m_state.variable;
+    }
+
+    Vector2 variable_product() const {
+        return m_product_state.variable;
     }
 
 private:
@@ -151,6 +185,16 @@ private:
         Float batchAccumulation = 0;
         Float batchGradient = 0;
     } m_state;
+
+    struct ProductState {
+        int iter = 0;
+        Vector2 firstMoment = Vector2(0.0f);
+        Vector2 secondMoment = Vector2(0.0f);
+        Vector2 variable = Vector2(-0.693147181f, 0.0f); // Results in equal probability for all sampling methods
+
+        Float batchAccumulation = 0;
+        Vector2 batchGradient = Vector2(0.0f);
+    } m_product_state;
 
     struct Hyperparameters {
         Float learningRate;
@@ -171,6 +215,12 @@ enum class EBsdfSamplingFractionLoss {
     ENone,
     EKL,
     EVariance,
+};
+
+enum class EGuidingMode {
+    ERadiance,
+    EProduct,
+    ECombined
 };
 
 enum class ESpatialFilter {
@@ -1025,7 +1075,8 @@ private:
 struct DTreeRecord {
     Vector d;
     Float radiance, product;
-    Float woPdf, bsdfPdf, dTreePdf;
+    Float woPdf, bsdfPdf, dTreePdf, productPdf;
+    EGuidingMode guidingMode;
     Float statisticalWeight;
     bool isDelta;
 };
@@ -1042,7 +1093,10 @@ public:
         }
 
         if (bsdfSamplingFractionLoss != EBsdfSamplingFractionLoss::ENone && rec.product > 0) {
-            optimizeBsdfSamplingFraction(rec, bsdfSamplingFractionLoss == EBsdfSamplingFractionLoss::EKL ? 1.0f : 2.0f);
+            if (rec.guidingMode == EGuidingMode::ECombined)
+                optimizeBsdfSamplingFractionProduct(rec);
+            else
+                optimizeBsdfSamplingFraction(rec, bsdfSamplingFractionLoss == EBsdfSamplingFractionLoss::EKL ? 1.0f : 2.0f);
         }
     }
 
@@ -1109,6 +1163,15 @@ public:
         return bsdfSamplingFraction(bsdfSamplingFractionOptimizer.variable());
     }
 
+    inline Vector2 bsdfSamplingFractionProduct() const {
+        m_lock_product.lock();
+        const Vector2 variableProduct = bsdfSamplingFractionOptimizer.variable_product();
+        m_lock_product.unlock();
+        return Vector2(
+            bsdfSamplingFraction(variableProduct.x),
+            bsdfSamplingFraction(variableProduct.y));
+    }
+
     void optimizeBsdfSamplingFraction(const DTreeRecord& rec, Float ratioPower) {
         m_lock.lock();
 
@@ -1134,6 +1197,39 @@ public:
         bsdfSamplingFractionOptimizer.append(lossGradient, rec.statisticalWeight);
 
         m_lock.unlock();
+    }
+
+    void optimizeBsdfSamplingFractionProduct(const DTreeRecord& rec) {
+        m_lock_product.lock();
+
+        // GRADIENT COMPUTATION
+        Vector2 variable = bsdfSamplingFractionOptimizer.variable_product();
+        Vector2 samplingFraction(bsdfSamplingFraction(variable.x), bsdfSamplingFraction(variable.y));
+
+        // Loss gradient w.r.t. sampling fraction
+        Float mixPdf = samplingFraction.x * rec.bsdfPdf +
+                    (1.0f - samplingFraction.x) * (samplingFraction.y * rec.productPdf +
+                    (1.0f - samplingFraction.y) * rec.dTreePdf);
+
+        Vector2 dSamplingFraction(-rec.product / (rec.woPdf * mixPdf));
+        dSamplingFraction.x *= rec.bsdfPdf - samplingFraction.y * rec.productPdf +
+                                              (1.0f - samplingFraction.y) * rec.dTreePdf;
+        dSamplingFraction.y *= (1.0f - samplingFraction.x) * (rec.productPdf - rec.dTreePdf);
+
+        Vector2 d_theta(
+            dSamplingFraction.x * samplingFraction.x * (1.0f - samplingFraction.x),
+            dSamplingFraction.y * samplingFraction.y * (1.0f - samplingFraction.y));
+
+        // We want some regularization such that our parameter does not become too big.
+        // We use l2 regularization, resulting in the following linear gradient.
+        Vector2 l2RegGradient = 0.01f * variable;
+
+        Vector2 lossGradient = l2RegGradient + d_theta;
+
+        // ADAM GRADIENT DESCENT
+        bsdfSamplingFractionOptimizer.append_product(lossGradient, rec.statisticalWeight);
+
+        m_lock_product.unlock();
     }
 
     void dump(BlobWriter& blob, const Point& p, const Vector& size) const {
@@ -1164,7 +1260,7 @@ private:
     DTree building;
     DTree sampling;
 
-    AdamOptimizer bsdfSamplingFractionOptimizer{0.01f};
+    AdamOptimizer bsdfSamplingFractionOptimizer{0.001f};
 
     RadianceProxy radianceProxy;
 
@@ -1186,7 +1282,10 @@ private:
         }
     private:
         std::atomic_flag m_mutex;
-    } m_lock;
+    };
+
+    SpinLock m_lock;
+    mutable SpinLock m_lock_product;
 };
 
 struct STreeNode {
@@ -1276,7 +1375,7 @@ struct STreeNode {
         Float w = computeOverlappingVolume(min1, max1, min2, min2 + size2);
         if (w > 0) {
             if (isLeaf) {
-                dTree.record({ rec.d, rec.radiance, rec.product, rec.woPdf, rec.bsdfPdf, rec.dTreePdf, rec.statisticalWeight * w, rec.isDelta }, directionalFilter, bsdfSamplingFractionLoss);
+                dTree.record({ rec.d, rec.radiance, rec.product, rec.woPdf, rec.bsdfPdf, rec.dTreePdf, rec.productPdf, rec.guidingMode, rec.statisticalWeight * w, rec.isDelta }, directionalFilter, bsdfSamplingFractionLoss);
             } else {
                 size2[axis] /= 2;
                 for (int i = 0; i < 2; ++i) {
@@ -1522,6 +1621,9 @@ public:
         m_dTreeThreshold = props.getFloat("dTreeThreshold", 0.01f);
         m_bsdfSamplingFraction = props.getFloat("bsdfSamplingFraction", 0.5f);
         m_sppPerPass = props.getInteger("sppPerPass", 4);
+
+        m_bsdfSamplingFraction = 0.2f;
+        m_productSamplingFraction = 1.0f;
 
         m_budgetStr = props.getString("budgetType", "seconds");
         if (m_budgetStr == "spp") {
@@ -2099,42 +2201,141 @@ public:
         }
     }
 
-    Spectrum sampleMat(const BSDF* bsdf, BSDFSamplingRecord& bRec, Float& woPdf, Float& bsdfPdf, Float& dTreePdf, Float bsdfSamplingFraction, RadianceQueryRecord& rRec, const DTreeWrapper* dTree) const {
+    void setGuidingMode(const BSDF *bsdf, const BSDFSamplingRecord &bRec, RadianceProxy &radianceProxy, const DTreeWrapper *dTree, Float &bsdfSamplingFraction, Float &productSamplingFraction, EGuidingMode &guidingMode) const
+    {
+        auto type = bsdf->getType();
+        const bool canUseGuiding = m_isBuilt && dTree && (type & BSDF::EDelta) != (type & BSDF::EAll);
+
+        if (!canUseGuiding)
+        {
+            bsdfSamplingFraction = 1.0f;
+            productSamplingFraction = 0.0f;
+        }
+        else
+        {
+            // Fixed fraction case
+            if (m_bsdfSamplingFractionLoss == EBsdfSamplingFractionLoss::ENone)
+            {
+
+                if (m_productSamplingFraction > 0.0f)
+                {
+                    // Try Init product guiding
+                    BSDFProxy bsdfProxy;
+                    bool flipNormal;
+                    const bool useProductGuiding = radianceProxy.is_built() && bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
+                    const Vector proxyNormal = flipNormal ? -Vector(bRec.its.shFrame.n) : Vector(bRec.its.shFrame.n);
+
+                    if (useProductGuiding)
+                    {
+                        radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal);
+                        bsdfSamplingFraction = m_bsdfSamplingFraction;
+                        productSamplingFraction = m_productSamplingFraction;
+                    }
+                    else
+                    {
+                        bsdfSamplingFraction = 1.0f;
+                        productSamplingFraction = 0.0f;
+                    }
+                }
+                else
+                {
+                    bsdfSamplingFraction = 1.0f;
+                    productSamplingFraction = 0.0f;
+                }
+            }
+            // Learned fraction
+            else
+            {
+                if (m_guidingMode == EGuidingMode::EProduct || m_guidingMode == EGuidingMode::ECombined)
+                {
+                    // Try Init product guiding
+                    BSDFProxy bsdfProxy;
+                    bool flipNormal;
+                    const bool useProductGuiding = radianceProxy.is_built() && bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
+                    const Vector proxyNormal = flipNormal ? -Vector(bRec.its.shFrame.n) : Vector(bRec.its.shFrame.n);
+
+                    if (useProductGuiding)
+                        radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal);
+
+                    if (m_guidingMode == EGuidingMode::EProduct)
+                    {
+                        guidingMode = EGuidingMode::EProduct;
+                        bsdfSamplingFraction = useProductGuiding ? dTree->bsdfSamplingFraction() : 1.0f;
+                        productSamplingFraction = useProductGuiding ? 1.0f : 0.0f;
+                    }
+                    else
+                    {
+                        if (useProductGuiding)
+                        {
+                            guidingMode = EGuidingMode::ECombined;
+                            const Vector2 samplingFractions = dTree->bsdfSamplingFractionProduct();
+                            bsdfSamplingFraction = samplingFractions.x;
+                            productSamplingFraction = samplingFractions.y;
+                        }
+                        else
+                        {
+                            guidingMode = EGuidingMode::ERadiance;
+                            bsdfSamplingFraction = dTree->bsdfSamplingFraction();
+                            productSamplingFraction = 0.0f;
+                        }
+                    }
+                }
+                else // Path guiding
+                {
+                    guidingMode = EGuidingMode::ERadiance;
+                    bsdfSamplingFraction = dTree->bsdfSamplingFraction();
+                    productSamplingFraction = 0.0f;
+                }
+            }
+        }
+    }
+
+    Spectrum sampleMat(const BSDF* bsdf, const RadianceProxy& radianceProxy, BSDFSamplingRecord& bRec, Float& woPdf, Float& bsdfPdf, Float& dTreePdf, Float& productPdf, const Float bsdfSamplingFraction, const Float productSamplingFraction, RadianceQueryRecord& rRec, const DTreeWrapper* dTree) const {
         Point2 sample = rRec.nextSample2D();
 
-        auto type = bsdf->getType();
-        if (!m_isBuilt || !dTree || (type & BSDF::EDelta) == (type & BSDF::EAll)) {
-            auto result = bsdf->sample(bRec, bsdfPdf, sample);
-            woPdf = bsdfPdf;
-            dTreePdf = 0;
-            return result;
-        }
+        // auto type = bsdf->getType();
+        // if (!m_isBuilt || !dTree || (type & BSDF::EDelta) == (type & BSDF::EAll)) {
+        //     auto result = bsdf->sample(bRec, bsdfPdf, sample);
+        //     woPdf = bsdfPdf;
+        //     productPdf = dTreePdf = 0;
+        //     return result;
+        // }
 
         Spectrum result;
         if (sample.x < bsdfSamplingFraction) {
             sample.x /= bsdfSamplingFraction;
             result = bsdf->sample(bRec, bsdfPdf, sample);
             if (result.isZero()) {
-                woPdf = bsdfPdf = dTreePdf = 0;
+                woPdf = bsdfPdf = dTreePdf = productPdf = 0;
                 return Spectrum{0.0f};
             }
 
             // If we sampled a delta component, then we have a 0 probability
             // of sampling that direction via guiding, thus we can return early.
             if (bRec.sampledType & BSDF::EDelta) {
-                dTreePdf = 0;
+                productPdf = dTreePdf = 0;
                 woPdf = bsdfPdf * bsdfSamplingFraction;
                 return result / bsdfSamplingFraction;
             }
 
             result *= bsdfPdf;
         } else {
-            sample.x = (sample.x - bsdfSamplingFraction) / (1 - bsdfSamplingFraction);
-            bRec.wo = bRec.its.toLocal(dTree->sample(rRec.sampler));
+            // Product guiding
+            if (sample.y < productSamplingFraction)
+            {
+                Vector wo;
+                radianceProxy.sample(rRec.sampler, wo);
+                bRec.wo = bRec.its.toLocal(wo);
+            }
+            // else D-Tree guiding
+            else
+            {
+                bRec.wo = bRec.its.toLocal(dTree->sample(rRec.sampler));
+            }
             result = bsdf->eval(bRec);
         }
 
-        pdfMat(woPdf, bsdfPdf, dTreePdf, bsdfSamplingFraction, bsdf, bRec, dTree);
+        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bRec, dTree);
         if (woPdf == 0) {
             return Spectrum{0.0f};
         }
@@ -2142,23 +2343,27 @@ public:
         return result / woPdf;
     }
 
-    void pdfMat(Float& woPdf, Float& bsdfPdf, Float& dTreePdf, Float bsdfSamplingFraction, const BSDF* bsdf, const BSDFSamplingRecord& bRec, const DTreeWrapper* dTree) const {
-        dTreePdf = 0;
+    void pdfMat(Float &woPdf, Float &bsdfPdf, Float &dTreePdf, Float &productPdf, Float bsdfSamplingFraction, Float productSamplingFraction, const BSDF *bsdf, const RadianceProxy &radianceProxy, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree) const
+    {
+        productPdf = dTreePdf = 0;
 
         auto type = bsdf->getType();
         if (!m_isBuilt || !dTree || (type & BSDF::EDelta) == (type & BSDF::EAll)) {
             woPdf = bsdfPdf = bsdf->pdf(bRec);
+            productPdf = dTreePdf = 0;
             return;
         }
 
         bsdfPdf = bsdf->pdf(bRec);
         if (!std::isfinite(bsdfPdf)) {
-            woPdf = 0;
+            woPdf = bsdfPdf = 0;
             return;
         }
 
         dTreePdf = dTree->pdf(bRec.its.toWorld(bRec.wo));
-        woPdf = bsdfSamplingFraction * bsdfPdf + (1 - bsdfSamplingFraction) * dTreePdf;
+        productPdf = radianceProxy.pdf(bRec.its.toWorld(bRec.wo));
+            
+        woPdf = bsdfSamplingFraction * bsdfPdf + (1.0f - bsdfSamplingFraction) * (productSamplingFraction * productPdf + (1.0f - productSamplingFraction) * dTreePdf);
     }
 
     Spectrum Li(const RayDifferential &r, RadianceQueryRecord &rRec) const {
@@ -2172,7 +2377,8 @@ public:
 
             Spectrum radiance;
 
-            Float woPdf, bsdfPdf, dTreePdf;
+            Float woPdf, bsdfPdf, dTreePdf, productPdf;
+            EGuidingMode guidingMode;
             bool isDelta;
 
             void record(const Spectrum& r) {
@@ -2190,7 +2396,7 @@ public:
                 if (throughput[2] * woPdf > Epsilon) localRadiance[2] = radiance[2] / throughput[2];
                 Spectrum product = localRadiance * bsdfVal;
 
-                DTreeRecord rec{ ray.d, localRadiance.average(), product.average(), woPdf, bsdfPdf, dTreePdf, statisticalWeight, isDelta };
+                DTreeRecord rec{ray.d, localRadiance.average(), product.average(), woPdf, bsdfPdf, dTreePdf, productPdf, guidingMode, statisticalWeight, isDelta};
                 switch (spatialFilter) {
                     case ESpatialFilter::ENearest:
                         dTree->record(rec, directionalFilter, bsdfSamplingFractionLoss);
@@ -2403,6 +2609,7 @@ public:
                 }
 
                 Float bsdfSamplingFraction = m_bsdfSamplingFraction;
+                Float productSamplingFraction;
                 if (dTree && m_bsdfSamplingFractionLoss != EBsdfSamplingFractionLoss::ENone) {
                     bsdfSamplingFraction = dTree->bsdfSamplingFraction();
                 }
@@ -2413,60 +2620,67 @@ public:
 
                 /* Sample BSDF * cos(theta) */
                 BSDFSamplingRecord bRec(its, rRec.sampler, ERadiance);
-                Float woPdf, bsdfPdf, dTreePdf;
-                Spectrum bsdfWeight = sampleMat(bsdf, bRec, woPdf, bsdfPdf, dTreePdf, bsdfSamplingFraction, rRec, dTree);
+                Float woPdf, bsdfPdf, dTreePdf, productPdf;
+                EGuidingMode guidingMode;
+                RadianceProxy radianceProxy;
+                if (dTree)
+                    radianceProxy = dTree->getRadianceProxy();
+                
+                setGuidingMode(bsdf, bRec, radianceProxy, dTree, bsdfSamplingFraction, productSamplingFraction, guidingMode);
+
+                Spectrum bsdfWeight = sampleMat(bsdf, radianceProxy, bRec, woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, rRec, dTree);
 
                 // Visualize RadianceProxy
-                if (m_isFinalIter && dTree)
-                {
-                    RadianceProxy radianceProxy(dTree->getRadianceProxy());
-                    if (radianceProxy.is_built())
-                    {
-                        const Vector n = its.shFrame.n;
-                        const Vector dir = bRec.its.toWorld(bRec.wo);
-                        const float radiance = radianceProxy.proxy_radiance(dir);
-                        // const float radiance = dTree->radiance(dir);
-                        BSDFProxy bsdfProxy;
-                        bool flipNormal;
-                        const bool useBsdfProxy = bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
-                        Spectrum Li;
-                        if (useBsdfProxy)
-                        {
+                // if (m_isFinalIter && dTree)
+                // {
+                //     RadianceProxy radianceProxy(dTree->getRadianceProxy());
+                //     if (radianceProxy.is_built())
+                //     {
+                //         const Vector n = its.shFrame.n;
+                //         const Vector dir = bRec.its.toWorld(bRec.wo);
+                //         const float radiance = radianceProxy.proxy_radiance(dir);
+                //         // const float radiance = dTree->radiance(dir);
+                //         BSDFProxy bsdfProxy;
+                //         bool flipNormal;
+                //         const bool useBsdfProxy = bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
+                //         Spectrum Li;
+                //         if (useBsdfProxy)
+                //         {
 
-                            // bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), flipNormal ? -n : n);
-                            // const float bsdfVal = woPdf == 0 ? 0.0f : bsdfProxy.evaluate(dir) / woPdf;
-                            // Li = (radiance * bsdfVal) * throughput;
+                //             // bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), flipNormal ? -n : n);
+                //             // const float bsdfVal = woPdf == 0 ? 0.0f : bsdfProxy.evaluate(dir) / woPdf;
+                //             // Li = (radiance * bsdfVal) * throughput;
 
-                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), flipNormal ? -n : n);
-                            Vector wo;
-                            const float productPdf = radianceProxy.sample(rRec.sampler, wo);
-                            const float product = productPdf == 0 ? 0.0f : radianceProxy.proxy_radiance(wo) / productPdf;
-                            Li = product * throughput;
-                        }
-                        else
-                        {
-                            // Li = radiance * bsdfWeight * throughput;
-                            // Li = radiance * bsdfWeight.average() * throughput;
-                            Spectrum Li;
-                            Li.fromLinearRGB(0.0f, 1.0f, 1.0f);
-                            return Li;
-                        }
+                //             radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), flipNormal ? -n : n);
+                //             Vector wo;
+                //             const float productPdf = radianceProxy.sample(rRec.sampler, wo);
+                //             const float product = productPdf == 0 ? 0.0f : radianceProxy.proxy_radiance(wo) / productPdf;
+                //             Li = product * throughput;
+                //         }
+                //         else
+                //         {
+                //             // Li = radiance * bsdfWeight * throughput;
+                //             // Li = radiance * bsdfWeight.average() * throughput;
+                //             Spectrum Li;
+                //             Li.fromLinearRGB(0.0f, 1.0f, 1.0f);
+                //             return Li;
+                //         }
 
-                        return Li;
-                    }
-                    else
-                    {
-                        Spectrum Li;
-                        Li.fromLinearRGB(0.0f, 0.0f, 1.0f);
-                        return Li;
-                    }
-                }
-                else if (m_isFinalIter && !dTree)
-                {
-                    Spectrum Li;
-                    Li.fromLinearRGB(1.0f, 1.0f, 0.0f);
-                    return Li;
-                }
+                //         return Li;
+                //     }
+                //     else
+                //     {
+                //         Spectrum Li;
+                //         Li.fromLinearRGB(0.0f, 0.0f, 1.0f);
+                //         return Li;
+                //     }
+                // }
+                // else if (m_isFinalIter && !dTree)
+                // {
+                //     Spectrum Li;
+                //     Li.fromLinearRGB(1.0f, 1.0f, 0.0f);
+                //     return Li;
+                // }
 
                 /* ==================================================================== */
                 /*                          Luminaire sampling                          */
@@ -2498,7 +2712,7 @@ public:
                             const Emitter *emitter = static_cast<const Emitter *>(dRec.object);
                             Float woPdf = 0, bsdfPdf = 0, dTreePdf = 0;
                             if (emitter->isOnSurface() && dRec.measure == ESolidAngle) {
-                                pdfMat(woPdf, bsdfPdf, dTreePdf, bsdfSamplingFraction, bsdf, bRec, dTree);
+                                pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bRec, dTree);
                             }
 
                             /* Weight using the power heuristic */
@@ -2519,6 +2733,8 @@ public:
                                         dRec.pdf,
                                         bsdfPdf,
                                         dTreePdf,
+                                        productPdf,
+                                        guidingMode,
                                         false,
                                     };
 
@@ -2571,6 +2787,8 @@ public:
                                 woPdf,
                                 bsdfPdf,
                                 dTreePdf,
+                                productPdf,
+                                guidingMode,
                                 true,
                             };
 
@@ -2613,6 +2831,8 @@ public:
                                 woPdf,
                                 bsdfPdf,
                                 dTreePdf,
+                                productPdf,
+                                guidingMode,
                                 isDelta,
                             };
 
@@ -2924,6 +3144,9 @@ private:
 
     /// The time at which rendering started.
     std::chrono::steady_clock::time_point m_startTime;
+
+    EGuidingMode m_guidingMode = EGuidingMode::ECombined;
+    Float m_productSamplingFraction;
 
 public:
     MTS_DECLARE_CLASS()
