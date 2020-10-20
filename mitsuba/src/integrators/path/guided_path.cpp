@@ -97,8 +97,9 @@ inline Point2 dirToCanonical(const Vector &d)
 // Implements the stochastic-gradient-based Adam optimizer [Kingma and Ba 2014]
 class AdamOptimizer {
 public:
-    AdamOptimizer(Float learningRate, int batchSize = 1, Float epsilon = 1e-08f, Float beta1 = 0.9f, Float beta2 = 0.999f) {
-		m_hparams = { learningRate, batchSize, epsilon, beta1, beta2 };
+    AdamOptimizer(Float learningRate, Float learningRateProduct, int batchSize = 1, Float epsilon = 1e-08f, Float beta1 = 0.9f, Float beta2 = 0.999f)
+    {
+        m_hparams = {learningRate, learningRateProduct, batchSize, epsilon, beta1, beta2};
 	}
 
     AdamOptimizer& operator=(const AdamOptimizer& arg) {
@@ -153,7 +154,7 @@ public:
     void step_product(Vector2 gradient) {
         ++m_product_state.iter;
 
-        Float actualLearningRate = m_hparams.learningRate * std::sqrt(1 - std::pow(m_hparams.beta2, m_product_state.iter)) / (1 - std::pow(m_hparams.beta1, m_product_state.iter));
+        Float actualLearningRate = m_hparams.learningRateProduct * std::sqrt(1 - std::pow(m_hparams.beta2, m_product_state.iter)) / (1 - std::pow(m_hparams.beta1, m_product_state.iter));
         m_product_state.firstMoment = m_hparams.beta1 * m_product_state.firstMoment + (1 - m_hparams.beta1) * gradient;
         m_product_state.secondMoment = m_hparams.beta2 * m_product_state.secondMoment + (1 - m_hparams.beta2) * Vector2(gradient.x * gradient.x, gradient.y + gradient.y);
         m_product_state.variable.x -= actualLearningRate * m_product_state.firstMoment.x / (std::sqrt(m_product_state.secondMoment.x) + m_hparams.epsilon);
@@ -198,6 +199,7 @@ private:
 
     struct Hyperparameters {
         Float learningRate;
+        Float learningRateProduct;
         int batchSize;
         Float epsilon;
         Float beta1;
@@ -785,6 +787,7 @@ float RadianceProxy::sample(
     Vector3f &direction) const
 {
     assert(m_is_built);
+    assert(m_product_is_built);
     // Sample the importance map.
     Point2f s = sampler->next2D();
     Point2u pixel;
@@ -829,6 +832,7 @@ float RadianceProxy::pdf(
     const Vector3f &direction) const
 {
     assert(m_is_built);
+    assert(m_product_is_built);
 
     const Point2f cylindrical_direction = dirToCanonical(direction);
     const Point2f cylindrical_direction_scaled = cylindrical_direction * static_cast<float>(ProxyWidth);
@@ -1260,7 +1264,7 @@ private:
     DTree building;
     DTree sampling;
 
-    AdamOptimizer bsdfSamplingFractionOptimizer{0.001f};
+    AdamOptimizer bsdfSamplingFractionOptimizer{0.01, 0.001f};
 
     RadianceProxy radianceProxy;
 
@@ -1622,7 +1626,7 @@ public:
         m_bsdfSamplingFraction = props.getFloat("bsdfSamplingFraction", 0.5f);
         m_sppPerPass = props.getInteger("sppPerPass", 4);
 
-        m_bsdfSamplingFraction = 0.2f;
+        m_bsdfSamplingFraction = 0.0001f;
         m_productSamplingFraction = 1.0f;
 
         m_budgetStr = props.getString("budgetType", "seconds");
@@ -2361,7 +2365,7 @@ public:
         }
 
         dTreePdf = dTree->pdf(bRec.its.toWorld(bRec.wo));
-        productPdf = radianceProxy.pdf(bRec.its.toWorld(bRec.wo));
+        productPdf = productSamplingFraction == 0.0f ? 0.0f : radianceProxy.pdf(bRec.its.toWorld(bRec.wo));
             
         woPdf = bsdfSamplingFraction * bsdfPdf + (1.0f - bsdfSamplingFraction) * (productSamplingFraction * productPdf + (1.0f - productSamplingFraction) * dTreePdf);
     }
@@ -3145,7 +3149,7 @@ private:
     /// The time at which rendering started.
     std::chrono::steady_clock::time_point m_startTime;
 
-    EGuidingMode m_guidingMode = EGuidingMode::ECombined;
+    EGuidingMode m_guidingMode = EGuidingMode::EProduct;
     Float m_productSamplingFraction;
 
 public:
