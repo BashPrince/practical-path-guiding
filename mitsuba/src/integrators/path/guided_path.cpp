@@ -32,6 +32,10 @@
 #include <iomanip>
 #include <sstream>
 
+#include <immintrin.h>
+#include "vcl-v1/vectorclass.h"
+#include "vcl-v1/vectormath_trig.h"
+
 MTS_NAMESPACE_BEGIN
 
 class BlobWriter {
@@ -77,6 +81,20 @@ inline Vector canonicalToDir(Point2 p)
     math::sincos(phi, &sinPhi, &cosPhi);
 
     return {sinTheta * cosPhi, sinTheta * sinPhi, cosTheta};
+}
+
+inline void canonicalToDir_simd(const Vec8f& p_x, const Vec8f& p_y, Vec8f& outDir_x, Vec8f& outDir_y, Vec8f& outDir_z)
+{
+    const Vec8f cosTheta = Vec8f(2.0f) * p_x - Vec8f(1.0f);
+    const Vec8f phi = Vec8f(2.0f) * Vec8f(M_PI) * p_y;
+
+    const Vec8f sinTheta = sqrt(Vec8f(1.0f) - cosTheta * cosTheta);
+    Vec8f cosPhi;
+    const Vec8f sinPhi = sincos(&cosPhi, phi);
+
+    outDir_x = sinTheta * cosPhi;
+    outDir_y = sinTheta * sinPhi;
+    outDir_z = cosTheta;
 }
 
 inline Point2 dirToCanonical(const Vector &d)
@@ -270,6 +288,11 @@ public:
         const float radiance_scale);
 
     void build_product(
+        BSDFProxy &bsdf_proxy,
+        const Vector3f &outgoing,
+        const Vector3f &shading_normal);
+
+    void build_product_simd(
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
         const Vector3f &shading_normal);
@@ -758,6 +781,50 @@ void RadianceProxy::build_product(
 
             const size_t index = pixel.y * ProxyWidth + pixel.x;
             m_map[index] *= bsdf_proxy.evaluate(incoming);
+        }
+    }
+    // Build discrete 2D distribution
+    m_image_importance_sampler.build(m_map);
+}
+
+void RadianceProxy::build_product_simd(
+    BSDFProxy &bsdf_proxy,
+    const Vector3f &outgoing,
+    const Vector3f &shading_normal)
+{
+    assert(m_is_built);
+
+    if (m_product_is_built)
+        return;
+
+    bsdf_proxy.finish_parameterization(outgoing, shading_normal);
+    m_product_is_built = true;
+
+    const Vec8f inv_width(1.0f / ProxyWidth);
+    const Vec8i simd_loop_offsets(0, 1, 2, 3, 4, 5, 6, 7);
+
+    for (size_t y = 0; y < ProxyWidth; ++y)
+    {
+        const Vec8i pixel_y(y);
+
+        for (size_t x = 0; x < ProxyWidth; x += 8)
+        {
+            const Vec8i pixel_x = Vec8i(x) + simd_loop_offsets;
+            const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
+            const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
+
+            Vec8f incoming_x;
+            Vec8f incoming_y;
+            Vec8f incoming_z;
+
+            canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
+
+            const Vec8f bsdf_proxy_value(1.0f);// bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z);
+            const size_t index = y * ProxyWidth + x;
+            Vec8f radiance;
+            radiance.load_a(&m_map[index]);
+            radiance *= bsdf_proxy_value;
+            radiance.store_a(&m_map[index]);
         }
     }
     // Build discrete 2D distribution

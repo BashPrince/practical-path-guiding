@@ -35,6 +35,8 @@ if(MSVC AND CMAKE_CONFIGURATION_TYPES)
      FORCE)
 endif()
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -mavx2")
 
 # make config 'RelWithDebInfo' debuggable by disabling optimizations
 if(MSVC)
