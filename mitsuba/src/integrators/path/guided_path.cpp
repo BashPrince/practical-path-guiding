@@ -33,8 +33,8 @@
 #include <sstream>
 
 #include <immintrin.h>
-#include "vcl-v1/vectorclass.h"
-#include "vcl-v1/vectormath_trig.h"
+#include <mitsuba/productguiding/vcl-v1/vectorclass.h>
+#include <mitsuba/productguiding/vcl-v1/vectormath_trig.h>
 
 MTS_NAMESPACE_BEGIN
 
@@ -759,32 +759,37 @@ void RadianceProxy::build_product(
     const Vector3f &outgoing,
     const Vector3f &shading_normal)
 {
-    assert(m_is_built);
+    build_product_simd(
+        bsdf_proxy,
+        outgoing,
+        shading_normal);
+        
+    // assert(m_is_built);
 
-    if (m_product_is_built)
-        return;
+    // if (m_product_is_built)
+    //     return;
 
-    bsdf_proxy.finish_parameterization(outgoing, shading_normal);
-    m_product_is_built = true;
+    // bsdf_proxy.finish_parameterization(outgoing, shading_normal);
+    // m_product_is_built = true;
 
-    const float inv_width = 1.0f / ProxyWidth;
-    for (size_t y = 0; y < ProxyWidth; ++y)
-    {
-        for (size_t x = 0; x < ProxyWidth; ++x)
-        {
-            const Point2u pixel(x, y);
-            const Point2f cylindrical_direction(
-                (x + 0.5f) * inv_width,
-                (y + 0.5f) * inv_width);
+    // const float inv_width = 1.0f / ProxyWidth;
+    // for (size_t y = 0; y < ProxyWidth; ++y)
+    // {
+    //     for (size_t x = 0; x < ProxyWidth; ++x)
+    //     {
+    //         const Point2u pixel(x, y);
+    //         const Point2f cylindrical_direction(
+    //             (x + 0.5f) * inv_width,
+    //             (y + 0.5f) * inv_width);
 
-            const Vector3f incoming = canonicalToDir(cylindrical_direction);
+    //         const Vector3f incoming = canonicalToDir(cylindrical_direction);
 
-            const size_t index = pixel.y * ProxyWidth + pixel.x;
-            m_map[index] *= bsdf_proxy.evaluate(incoming);
-        }
-    }
-    // Build discrete 2D distribution
-    m_image_importance_sampler.build(m_map);
+    //         const size_t index = pixel.y * ProxyWidth + pixel.x;
+    //         m_map[index] *= bsdf_proxy.evaluate(incoming);
+    //     }
+    // }
+    // // Build discrete 2D distribution
+    // m_image_importance_sampler.build(m_map);
 }
 
 void RadianceProxy::build_product_simd(
@@ -819,7 +824,7 @@ void RadianceProxy::build_product_simd(
 
             canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
 
-            const Vec8f bsdf_proxy_value(1.0f);// bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z);
+            const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z);
             const size_t index = y * ProxyWidth + x;
             Vec8f radiance;
             radiance.load_a(&m_map[index]);
