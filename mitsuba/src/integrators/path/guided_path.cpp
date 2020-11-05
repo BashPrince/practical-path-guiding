@@ -379,16 +379,25 @@ public:
                 return 1.0f / (Width * Width);
             }
 
-            size_t y = 0;
-            while (s.y > marginalDistribution[y])
-                ++y;
-
-            assert(y < Width);
-            const std::array<float, Width> &conditionalDistribution = conditionalDistributions[y];
-
             size_t x = 0;
-            while (s.x > conditionalDistribution[x])
+            while (s.x > marginalDistribution[x])
                 ++x;
+
+            assert(x < Width);
+
+            size_t y = 0;
+            while (s.y > distribution[y * Width + x])
+                ++y;
+            // size_t y = 0;
+            // while (s.y > marginalDistribution[y])
+            //     ++y;
+
+            // assert(y < Width);
+            // const std::array<float, Width> &conditionalDistribution = conditionalDistributions[y];
+
+            // size_t x = 0;
+            // while (s.x > conditionalDistribution[x])
+            //     ++x;
             
 
             const size_t index = y * Width + x;
@@ -409,10 +418,31 @@ public:
             return discretePdf[index];
         }
 
+        float* get_distribution()
+        {
+            return distribution.data();
+        }
+
+        float* get_marginal_distribution()
+        {
+            return marginalDistribution.data();
+        }
+
+        float* get_discrete_pdf()
+        {
+            return discretePdf.data();
+        }
+
+        void set_to_zero()
+        {
+            isZero = true;
+        }
+
     private:
-        std::array<float, Width> marginalDistribution;
+        alignas(32) std::array<float, Width> marginalDistribution;
         std::array<std::array<float, Width>, Width> conditionalDistributions;
-        std::array<float, Width * Width> discretePdf;
+        alignas(32) std::array<float, Width * Width> discretePdf;
+        alignas(32) std::array<float, Width * Width> distribution;
         bool isZero = false;
     };
 
@@ -808,6 +838,13 @@ void RadianceProxy::build_product_simd(
     const Vec8f inv_width(1.0f / ProxyWidth);
     const Vec8i simd_loop_offsets(0, 1, 2, 3, 4, 5, 6, 7);
 
+    float* distribution = m_image_importance_sampler.get_distribution();
+    float* marginal_distribution = m_image_importance_sampler.get_marginal_distribution();
+    float* discrete_pdf = m_image_importance_sampler.get_discrete_pdf();
+
+    Vec8f distribution_sum_left(0.0f);
+    Vec8f distribution_sum_right(0.0f);
+
     for (size_t y = 0; y < ProxyWidth; ++y)
     {
         const Vec8i pixel_y(y);
@@ -830,10 +867,96 @@ void RadianceProxy::build_product_simd(
             radiance.load_a(&m_map[index]);
             radiance *= bsdf_proxy_value;
             radiance.store_a(&m_map[index]);
+
+            const Vec8f Zero(0.0f);
+            if (x == 0)
+            {
+                distribution_sum_left += select(radiance > Zero, radiance, Zero);
+                distribution_sum_left.store_a(&distribution[index]);
+            }
+            else
+            {
+                distribution_sum_right += select(radiance > Zero, radiance, Zero);
+                distribution_sum_right.store_a(&distribution[index]);
+            }
         }
     }
+
+    const float* conditional_sums = &distribution[(ProxyWidth - 1) * ProxyWidth];
+    float marginal_sum = 0.0f;
+
+    for (size_t i = 0; i < ProxyWidth; ++i)
+    {
+        marginal_sum += conditional_sums[i];
+        marginal_distribution[i] = marginal_sum;
+    }
+
+    const float invMarginalSum = marginal_distribution[ProxyWidth - 1] <= 0.0f ? 0.0f : 1.0f / marginal_distribution[ProxyWidth - 1];
+
+    if(invMarginalSum != 0.0f)
+    {
+        for (size_t i = 0; i < ProxyWidth; ++i)
+        {
+            marginal_distribution[i] *= invMarginalSum;
+        }
+
+        marginal_distribution[ProxyWidth - 1] = 1.0f;
+
+        Vec8f distribution_row_left, distribution_row_right;
+        const auto div_mask_left = distribution_sum_left > Vec8f(0.0f);
+        const auto div_mask_right = distribution_sum_right > Vec8f(0.0f);
+
+        for (size_t y = 0; y < ProxyWidth - 1; ++y)
+        {
+            const Vec8i pixel_y(y);
+
+            for (size_t x = 0; x < ProxyWidth; x += 8)
+            {
+                const size_t index = y * ProxyWidth + x;
+
+                if (x == 0)
+                {
+                    distribution_row_left.load_a(&distribution[index]);
+                    distribution_row_left = if_div(div_mask_left, distribution_row_left, distribution_sum_left);
+                    distribution_row_left.store_a(&distribution[index]);
+                }
+                else
+                {
+                    distribution_row_right.load_a(&distribution[index]);
+                    distribution_row_right = if_div(div_mask_right, distribution_row_right, distribution_sum_right);
+                    distribution_row_right.store_a(&distribution[index]);
+                }
+            }
+        }
+
+        Vec8f(1.0f).store_a(&distribution[(ProxyWidth - 1) * ProxyWidth]);
+
+        if (ProxyWidth > 8)
+            Vec8f(1.0f).store_a(&distribution[(ProxyWidth - 1) * ProxyWidth + 8]);
+
+        // Set discrete pdf
+        for (size_t y = 0; y < ProxyWidth; ++y)
+        {
+            const Vec8i pixel_y(y);
+
+            for (size_t x = 0; x < ProxyWidth; x += 8)
+            {
+                const size_t index = y * ProxyWidth + x;
+
+                const Vec8f invTotal(invMarginalSum);
+                Vec8f radiance;
+                radiance.load_a(&m_map[index]);
+                (radiance * invTotal).store_a(&discrete_pdf[index]);
+            }
+        }
+    }
+    else
+    {
+        m_image_importance_sampler.set_to_zero();
+    }
+
     // Build discrete 2D distribution
-    m_image_importance_sampler.build(m_map);
+    // m_image_importance_sampler.build(m_map);
 }
 
 void RadianceProxy::clear()
@@ -1698,8 +1821,8 @@ public:
         m_bsdfSamplingFraction = props.getFloat("bsdfSamplingFraction", 0.5f);
         m_sppPerPass = props.getInteger("sppPerPass", 4);
 
-        m_bsdfSamplingFraction = 0.0001f;
-        m_productSamplingFraction = 1.0f;
+        m_bsdfSamplingFraction = 0.1f;
+        m_productSamplingFraction = 0.0f;
 
         m_budgetStr = props.getString("budgetType", "seconds");
         if (m_budgetStr == "spp") {
