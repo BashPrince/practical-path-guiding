@@ -36,6 +36,8 @@
 #include <mitsuba/productguiding/vcl-v1/vectorclass.h>
 #include <mitsuba/productguiding/vcl-v1/vectormath_trig.h>
 
+#include <mutex>
+
 MTS_NAMESPACE_BEGIN
 
 class BlobWriter {
@@ -111,6 +113,115 @@ inline Point2 dirToCanonical(const Vector &d)
 
     return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
 }
+
+alignas(32) float worldDir_x[16 * 16] = 
+{0.3412988484,
+0.5717597604, 0.7122309804, 0.8109106421, 0.8819402456, 0.9316653609, 0.9633906484, 0.9788678288, 0.9788678288,
+0.9633906484, 0.9316653609, 0.8819402456, 0.8109106421, 0.7122309804, 0.5717597604, 0.3412988484, 0.2893391550,
+0.4847145081, 0.6038002372, 0.6874568462, 0.7476727962, 0.7898277044, 0.8167231083, 0.8298440576, 0.8298440576,
+0.8167231083, 0.7898277044, 0.7476727962, 0.6874568462, 0.6038002372, 0.4847145081, 0.2893391550, 0.1933302432,
+0.3238758743, 0.4034463763, 0.4593439400, 0.4995789528, 0.5277459621, 0.5457169414, 0.5544840097, 0.5544840097,
+0.5457169414, 0.5277459621, 0.4995789528, 0.4593439400, 0.4034463763, 0.3238758743, 0.1933302432, 0.0678885281,
+0.1137300357, 0.1416714787, 0.1613000780, 0.1754287332, 0.1853196770, 0.1916302294, 0.1947088242, 0.1947088242,
+0.1916302294, 0.1853196770, 0.1754287332, 0.1613000780, 0.1416714787, 0.1137300357, 0.0678885281, -0.0678885579,
+-0.1137300879, -0.1416715384, -0.1613001525, -0.1754288226, -0.1853197515, -0.1916303188, -0.1947089136, -0.1947089136,
+-0.1916303188, -0.1853197515, -0.1754288226, -0.1613001525, -0.1416715384, -0.1137300879, -0.0678885579, -0.1933303028,
+-0.3238759637, -0.4034465253, -0.4593440890, -0.4995791018, -0.5277461410, -0.5457170606, -0.5544841886, -0.5544841886,
+-0.5457170606, -0.5277461410, -0.4995791018, -0.4593440890, -0.4034465253, -0.3238759637, -0.1933303028, -0.2893391848,
+-0.4847145379, -0.6038002372, -0.6874568462, -0.7476728559, -0.7898277640, -0.8167231679, -0.8298441172, -0.8298441172,
+-0.8167231679, -0.7898277640, -0.7476728559, -0.6874568462, -0.6038002372, -0.4847145379, -0.2893391848, -0.3412988484,
+-0.5717597604, -0.7122309804, -0.8109106421, -0.8819402456, -0.9316653609, -0.9633906484, -0.9788678288, -0.9788678288,
+-0.9633906484, -0.9316653609, -0.8819402456, -0.8109106421, -0.7122309804, -0.5717597604, -0.3412988484, -0.3412988186,
+-0.5717597604, -0.7122309208, -0.8109105825, -0.8819401860, -0.9316653013, -0.9633905888, -0.9788677692, -0.9788677692,
+-0.9633905888, -0.9316653013, -0.8819401860, -0.8109105825, -0.7122309208, -0.5717597604, -0.3412988186, -0.2893391550,
+-0.4847144783, -0.6038001776, -0.6874567866, -0.7476727366, -0.7898276448, -0.8167230487, -0.8298439980, -0.8298439980,
+-0.8167230487, -0.7898276448, -0.7476727366, -0.6874567866, -0.6038001776, -0.4847144783, -0.2893391550, -0.1933301836,
+-0.3238757551, -0.4034462571, -0.4593437910, -0.4995788038, -0.5277457833, -0.5457167625, -0.5544838309, -0.5544838309,
+-0.5457167625, -0.5277457833, -0.4995788038, -0.4593437910, -0.4034462571, -0.3238757551, -0.1933301836, -0.0678885803,
+-0.1137301251, -0.1416715831, -0.1613001972, -0.1754288673, -0.1853198111, -0.1916303784, -0.1947089732, -0.1947089732,
+-0.1916303784, -0.1853198111, -0.1754288673, -0.1613001972, -0.1416715831, -0.1137301251, -0.0678885803, 0.0678885877,
+0.1137301400, 0.1416716129, 0.1613002270, 0.1754288971, 0.1853198409, 0.1916304082, 0.1947090030, 0.1947090030,
+0.1916304082, 0.1853198409, 0.1754288971, 0.1613002270, 0.1416716129, 0.1137301400, 0.0678885877, 0.1933303177,
+0.3238759935, 0.4034465551, 0.4593441188, 0.4995791614, 0.5277462006, 0.5457171202, 0.5544842482, 0.5544842482,
+0.5457171202, 0.5277462006, 0.4995791614, 0.4593441188, 0.4034465551, 0.3238759935, 0.1933303177, 0.2893391550,
+0.4847144783, 0.6038001776, 0.6874567866, 0.7476727366, 0.7898276448, 0.8167230487, 0.8298439980, 0.8298439980,
+0.8167230487, 0.7898276448, 0.7476727366, 0.6874567866, 0.6038001776, 0.4847144783, 0.2893391550, 0.3412988484,
+0.5717597604, 0.7122309804, 0.8109106421, 0.8819402456, 0.9316653609, 0.9633906484, 0.9788678288, 0.9788678288,
+0.9633906484, 0.9316653609, 0.8819402456, 0.8109106421, 0.7122309804, 0.5717597604, 0.3412988484};
+
+alignas(32) float worldDir_y[16 * 16] = 
+{0.0678885579,
+0.1137300879, 0.1416715384, 0.1613001525, 0.1754288226, 0.1853197515, 0.1916303188, 0.1947089136, 0.1947089136,
+0.1916303188, 0.1853197515, 0.1754288226, 0.1613001525, 0.1416715384, 0.1137300879, 0.0678885579, 0.1933302581,
+0.3238759041, 0.4034464359, 0.4593439698, 0.4995790124, 0.5277460217, 0.5457170010, 0.5544840693, 0.5544840693,
+0.5457170010, 0.5277460217, 0.4995790124, 0.4593439698, 0.4034464359, 0.3238759041, 0.1933302581, 0.2893391848,
+0.4847145379, 0.6038002372, 0.6874568462, 0.7476728559, 0.7898277640, 0.8167231679, 0.8298441172, 0.8298441172,
+0.8167231679, 0.7898277640, 0.7476728559, 0.6874568462, 0.6038002372, 0.4847145379, 0.2893391848, 0.3412988484,
+0.5717597604, 0.7122309804, 0.8109106421, 0.8819402456, 0.9316653609, 0.9633906484, 0.9788678288, 0.9788678288,
+0.9633906484, 0.9316653609, 0.8819402456, 0.8109106421, 0.7122309804, 0.5717597604, 0.3412988484, 0.3412988484,
+0.5717597604, 0.7122309804, 0.8109106421, 0.8819402456, 0.9316653609, 0.9633906484, 0.9788678288, 0.9788678288,
+0.9633906484, 0.9316653609, 0.8819402456, 0.8109106421, 0.7122309804, 0.5717597604, 0.3412988484, 0.2893391550,
+0.4847144783, 0.6038001776, 0.6874567866, 0.7476727366, 0.7898276448, 0.8167230487, 0.8298439980, 0.8298439980,
+0.8167230487, 0.7898276448, 0.7476727366, 0.6874567866, 0.6038001776, 0.4847144783, 0.2893391550, 0.1933302432,
+0.3238758743, 0.4034463763, 0.4593439400, 0.4995789528, 0.5277459621, 0.5457169414, 0.5544840097, 0.5544840097,
+0.5457169414, 0.5277459621, 0.4995789528, 0.4593439400, 0.4034463763, 0.3238758743, 0.1933302432, 0.0678885505,
+0.1137300804, 0.1416715384, 0.1613001376, 0.1754288077, 0.1853197366, 0.1916303039, 0.1947088987, 0.1947088987,
+0.1916303039, 0.1853197366, 0.1754288077, 0.1613001376, 0.1416715384, 0.1137300804, 0.0678885505, -0.0678886175,
+-0.1137301847, -0.1416716576, -0.1613002867, -0.1754289567, -0.1853199154, -0.1916304827, -0.1947090775, -0.1947090775,
+-0.1916304827, -0.1853199154, -0.1754289567, -0.1613002867, -0.1416716576, -0.1137301847, -0.0678886175, -0.1933302879,
+-0.3238759339, -0.4034464657, -0.4593440294, -0.4995790720, -0.5277460814, -0.5457170606, -0.5544841290, -0.5544841290,
+-0.5457170606, -0.5277460814, -0.4995790720, -0.4593440294, -0.4034464657, -0.3238759339, -0.1933302879, -0.2893392444,
+-0.4847146273, -0.6038003564, -0.6874569654, -0.7476729751, -0.7898278832, -0.8167232871, -0.8298442364, -0.8298442364,
+-0.8167232871, -0.7898278832, -0.7476729751, -0.6874569654, -0.6038003564, -0.4847146273, -0.2893392444, -0.3412988484,
+-0.5717597604, -0.7122309804, -0.8109106421, -0.8819402456, -0.9316653609, -0.9633906484, -0.9788678288, -0.9788678288,
+-0.9633906484, -0.9316653609, -0.8819402456, -0.8109106421, -0.7122309804, -0.5717597604, -0.3412988484, -0.3412988186,
+-0.5717597604, -0.7122309208, -0.8109105825, -0.8819401860, -0.9316653013, -0.9633905888, -0.9788677692, -0.9788677692,
+-0.9633905888, -0.9316653013, -0.8819401860, -0.8109105825, -0.7122309208, -0.5717597604, -0.3412988186, -0.2893391252,
+-0.4847144485, -0.6038001180, -0.6874567270, -0.7476726770, -0.7898275852, -0.8167229891, -0.8298439384, -0.8298439384,
+-0.8167229891, -0.7898275852, -0.7476726770, -0.6874567270, -0.6038001180, -0.4847144485, -0.2893391252, -0.1933302879,
+-0.3238759339, -0.4034464657, -0.4593440294, -0.4995790720, -0.5277460814, -0.5457170606, -0.5544841290, -0.5544841290,
+-0.5457170606, -0.5277460814, -0.4995790720, -0.4593440294, -0.4034464657, -0.3238759339, -0.1933302879, -0.0678885207,
+-0.1137300283, -0.1416714638, -0.1613000631, -0.1754287183, -0.1853196621, -0.1916302145, -0.1947088093, -0.1947088093,
+-0.1916302145, -0.1853196621, -0.1754287183, -0.1613000631, -0.1416714638, -0.1137300283, -0.0678885207};
+
+alignas(32) float worldDir_z[16 * 16] = 
+{-0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
+-0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
+0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000};
+
+alignas(32) float cosines[256 * 256];
+bool cosines_loaded = false;
+std::mutex cosine_mutex;
 
 // Implements the stochastic-gradient-based Adam optimizer [Kingma and Ba 2014]
 class AdamOptimizer {
@@ -822,6 +933,53 @@ void RadianceProxy::build_product(
     // m_image_importance_sampler.build(m_map);
 }
 
+// Return cos theta of v to boundary in direction dest
+float cos_theta_to_boundary(const Point2u& p, const Point2u& dest, const float ProxyWidth)
+{
+    if (p == dest)
+        return 1.0f;
+
+    const float inv_width = 1.0f / ProxyWidth;
+    const Point2f cylindrical_direction_p(
+        (p.x + 0.5f) * inv_width,
+        (p.y + 0.5f) * inv_width);
+
+    const Point2f cylindrical_direction_dest(
+        (dest.x + 0.5f) * inv_width,
+        (dest.y + 0.5f) * inv_width);
+
+    const Vector3f incoming = canonicalToDir(cylindrical_direction_p);
+    const Vector3f destination = canonicalToDir(cylindrical_direction_dest);
+
+    // For opposite sides return 0
+    if ((incoming + destination).length() < 0.001)
+        return 0.0f;
+
+    const Vector3f diff = destination - incoming;
+
+    Vector3f current = incoming;
+    Point2u currentPixel = p;
+    Vector3f step = diff * 0.01f;
+
+    while (currentPixel == p)
+    {
+        // Step along line towards dest
+        current += step;
+
+        // Reproject onto sphere
+        const Vector3f s = normalize(current);
+        const Point2f s_canonical = dirToCanonical(s) * static_cast<float>(ProxyWidth);
+
+        // Pixel coords
+        currentPixel = Point2u(s_canonical.x, s_canonical.y);
+
+        currentPixel.x = std::min(currentPixel.x, static_cast<unsigned int>(ProxyWidth - 1));
+        currentPixel.y = std::min(currentPixel.y, static_cast<unsigned int>(ProxyWidth - 1));
+    }
+    
+    return dot(destination, normalize(current)) - dot(destination, incoming);
+}
+
 void RadianceProxy::build_product_simd(
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
@@ -845,6 +1003,38 @@ void RadianceProxy::build_product_simd(
     Vec8f distribution_sum_left(0.0f);
     Vec8f distribution_sum_right(0.0f);
 
+    if (!cosines_loaded)
+    {
+        std::lock_guard<std::mutex> guard(cosine_mutex);
+
+        if(!cosines_loaded)
+        {
+            char* data = reinterpret_cast<char*>(cosines);
+            std::ifstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::in | std::ios::binary);
+            file.read(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
+            file.close();
+
+            cosines_loaded = true;
+        }
+    }
+
+    Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
+    bsdf_proxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
+
+    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(ProxyWidth);
+    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(ProxyWidth);
+
+    Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
+    Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
+
+    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), ProxyWidth - 1);
+    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), ProxyWidth - 1);
+    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), ProxyWidth - 1);
+    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), ProxyWidth - 1);
+
+    const float* diffuse_cosines_array = &cosines[(diffuse_pixel.y * ProxyWidth + diffuse_pixel.x) * ProxyWidth * ProxyWidth];
+    const float* reflectance_cosines_array = &cosines[(reflectance_pixel.y * ProxyWidth + reflectance_pixel.x) * ProxyWidth * ProxyWidth];
+
     for (size_t y = 0; y < ProxyWidth; ++y)
     {
         const Vec8i pixel_y(y);
@@ -855,14 +1045,21 @@ void RadianceProxy::build_product_simd(
             const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
             const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
 
-            Vec8f incoming_x;
-            Vec8f incoming_y;
-            Vec8f incoming_z;
-
-            canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
-
-            const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z);
             const size_t index = y * ProxyWidth + x;
+
+            Vec8f incoming_x, incoming_y, incoming_z;
+            incoming_x.load_a(&worldDir_x[index]);
+            incoming_y.load_a(&worldDir_y[index]);
+            incoming_z.load_a(&worldDir_z[index]);
+
+            // canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
+
+            Vec8f diffuse_cosines(0.0f), reflectance_cosines(0.0f);
+            // Vec8f diffuse_cosines, reflectance_cosines;
+            // diffuse_cosines.load_a(&diffuse_cosines_array[index]);
+            // reflectance_cosines.load_a(&reflectance_cosines_array[index]);
+
+            const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z, diffuse_cosines, reflectance_cosines);
             Vec8f radiance;
             radiance.load_a(&m_map[index]);
             radiance *= bsdf_proxy_value;
@@ -882,7 +1079,40 @@ void RadianceProxy::build_product_simd(
         }
     }
 
-    const float* conditional_sums = &distribution[(ProxyWidth - 1) * ProxyWidth];
+    // float cosines[ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth];
+
+    // for (size_t dest_y = 0; dest_y < ProxyWidth; ++dest_y)
+    // {
+    //     for (size_t dest_x = 0; dest_x < ProxyWidth; ++dest_x)
+    //     {
+    //         const Point2u dest_pixel(dest_x, dest_y);
+    //         size_t dest_index = dest_y * ProxyWidth + dest_x;
+
+    //         for (size_t y = 0; y < ProxyWidth; ++y)
+    //         {
+    //             for (size_t x = 0; x < ProxyWidth; ++x)
+    //             {
+    //                 const Point2u incoming_pixel(x, y);
+    //                 size_t index = y * ProxyWidth + x;
+
+    //                 const float cos_theta = cos_theta_to_boundary(incoming_pixel, dest_pixel, ProxyWidth);
+    //                 cosines[dest_index * ProxyWidth * ProxyWidth + index] = cos_theta;
+
+    //                 if (cos_theta > M_PI / 4.0f && cos_theta != 1.0f)
+    //                 {
+    //                     const float cos_theta_2 = cos_theta_to_boundary(incoming_pixel, dest_pixel, ProxyWidth);
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+
+    // const char* data = reinterpret_cast<const char*>(cosines);
+    // std::ofstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::out | std::ios::binary);
+    // file.write(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
+    // file.close();
+
+    const float *conditional_sums = &distribution[(ProxyWidth - 1) * ProxyWidth];
     float marginal_sum = 0.0f;
 
     for (size_t i = 0; i < ProxyWidth; ++i)
@@ -1822,7 +2052,7 @@ public:
         m_sppPerPass = props.getInteger("sppPerPass", 4);
 
         m_bsdfSamplingFraction = 0.1f;
-        m_productSamplingFraction = 0.0f;
+        m_productSamplingFraction = 1.0f;
 
         m_budgetStr = props.getString("budgetType", "seconds");
         if (m_budgetStr == "spp") {
@@ -2416,7 +2646,7 @@ public:
             if (m_bsdfSamplingFractionLoss == EBsdfSamplingFractionLoss::ENone)
             {
 
-                if (m_productSamplingFraction > 0.0f)
+                if (m_guidingMode == EGuidingMode::EProduct)
                 {
                     // Try Init product guiding
                     BSDFProxy bsdfProxy;
@@ -2428,7 +2658,7 @@ public:
                     {
                         radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal);
                         bsdfSamplingFraction = m_bsdfSamplingFraction;
-                        productSamplingFraction = m_productSamplingFraction;
+                        productSamplingFraction = 1.0f;
                     }
                     else
                     {
@@ -2438,7 +2668,7 @@ public:
                 }
                 else
                 {
-                    bsdfSamplingFraction = 1.0f;
+                    bsdfSamplingFraction = m_bsdfSamplingFraction;
                     productSamplingFraction = 0.0f;
                 }
             }
@@ -2824,7 +3054,7 @@ public:
                 RadianceProxy radianceProxy;
                 if (dTree)
                     radianceProxy = dTree->getRadianceProxy();
-                
+
                 setGuidingMode(bsdf, bRec, radianceProxy, dTree, bsdfSamplingFraction, productSamplingFraction, guidingMode);
 
                 Spectrum bsdfWeight = sampleMat(bsdf, radianceProxy, bRec, woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, rRec, dTree);

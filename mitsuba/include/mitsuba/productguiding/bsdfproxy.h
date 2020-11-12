@@ -80,6 +80,14 @@ class BSDFProxy
         m_refraction_roughness *= scale_factor_refraction;
     }
 
+    inline void get_lobes(Vector3f& diffuse_lobe, Vector3f& translucency_lobe, Vector3f& reflection_lobe, Vector3f& refraction_lobe) const
+    {
+        diffuse_lobe = m_normal;
+        translucency_lobe = -m_normal;
+        reflection_lobe = m_reflection_lobe;
+        refraction_lobe = m_refraction_lobe;
+    }
+
     inline Vec8f ggx_lobe_incoming_simd(const Vec8f& cos_lobe_in, const Vec8f& weight, const Vec8f& alpha) const
     {
         const Vec8f cos2_lobe_in = cos_lobe_in * cos_lobe_in;
@@ -112,13 +120,13 @@ class BSDFProxy
     }
 
     inline Vec8f evaluate_simd(
-            const Vec8f &incoming_x, const Vec8f &incoming_y, const Vec8f &incoming_z) const
+            const Vec8f &incoming_x, const Vec8f &incoming_y, const Vec8f &incoming_z, const Vec8f& diffuse_cosines, const Vec8f& reflection_cosines) const
     {
         Vec8f value(0.0f);
         const Vec8f normal_x(m_normal.x);
         const Vec8f normal_y(m_normal.y);
         const Vec8f normal_z(m_normal.z);
-        const Vec8f cos_ni = dot_simd(normal_x, normal_y, normal_z, incoming_x, incoming_y, incoming_z);
+        const Vec8f cos_ni = min(dot_simd(normal_x, normal_y, normal_z, incoming_x, incoming_y, incoming_z) + diffuse_cosines, Vec8f(1.0f));
         const Vec8f cos_negni = -cos_ni;
 
         if (m_is_diffuse)
@@ -135,7 +143,7 @@ class BSDFProxy
             const Vec8f reflection_lobe_x(m_reflection_lobe.x);
             const Vec8f reflection_lobe_y(m_reflection_lobe.y);
             const Vec8f reflection_lobe_z(m_reflection_lobe.z);
-            const Vec8f cos_refl_i = dot_simd(reflection_lobe_x, reflection_lobe_y, reflection_lobe_z, incoming_x, incoming_y, incoming_z);
+            const Vec8f cos_refl_i = min(dot_simd(reflection_lobe_x, reflection_lobe_y, reflection_lobe_z, incoming_x, incoming_y, incoming_z) + reflection_cosines, Vec8f(1.0f));
 
             mask = mask & (cos_refl_i > Vec8f(0.0f));
             if (!horizontal_and(~mask))
