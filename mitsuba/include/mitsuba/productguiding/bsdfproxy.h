@@ -5,9 +5,17 @@
 
 #include <mitsuba/mitsuba.h>
 
-#include <mitsuba/productguiding/vcl-v1/vectorclass.h>
+#include <mitsuba/productguiding/vcl-v2/vectorclass.h>
 
 MTS_NAMESPACE_BEGIN
+
+// SIMD Vector constants
+Vec8f Zero_SIMD(0.0f);
+Vec8f One_SIMD(1.0f);
+Vec8f Two_SIMD(2.0f);
+Vec8f One_Half_SIMD(0.5f);
+Vec8f PI_SIMD(M_PI);
+Vec8f Epsilon_SIMD(0.0001f);
 
 class BSDFProxy
 {
@@ -78,6 +86,36 @@ class BSDFProxy
         const float cos_no = std::abs(dot(m_normal, outgoing));
         const float scale_factor_refraction = (cos_nt + m_eta * cos_no) / cos_nt;
         m_refraction_roughness *= scale_factor_refraction;
+
+        // Init SIMD
+        m_normal_x = Vec8f(m_normal.x);
+        m_normal_y = Vec8f(m_normal.y);
+        m_normal_z = Vec8f(m_normal.z);
+        m_diffuse_weight_SIMD = Vec8f(m_diffuse_weight);
+
+        if (m_is_reflective)
+        {
+            m_reflection_lobe_x = Vec8f(m_reflection_lobe.x);
+            m_reflection_lobe_y = Vec8f(m_reflection_lobe.y);
+            m_reflection_lobe_z = Vec8f(m_reflection_lobe.z);
+            m_reflection_weight_SIMD = Vec8f(m_reflection_weight);
+            m_reflection_roughness_SIMD = Vec8f(m_reflection_roughness);
+        }
+
+        if (m_is_refractive)
+        {
+            m_refraction_lobe_x = Vec8f(m_refraction_lobe.x);
+            m_refraction_lobe_y = Vec8f(m_refraction_lobe.y);
+            m_refraction_lobe_z = Vec8f(m_refraction_lobe.z);
+            m_refraction_weight_SIMD = Vec8f(m_refraction_weight);
+            m_refraction_roughness_SIMD = Vec8f(m_refraction_roughness);
+        }
+
+        if (m_is_translucent)
+        {
+            m_translucency_weight_SIMD = Vec8f(m_translucency_weight);
+        }
+
     }
 
     inline void get_lobes(Vector3f& diffuse_lobe, Vector3f& translucency_lobe, Vector3f& reflection_lobe, Vector3f& refraction_lobe) const
@@ -91,14 +129,13 @@ class BSDFProxy
     inline Vec8f ggx_lobe_incoming_simd(const Vec8f& cos_lobe_in, const Vec8f& weight, const Vec8f& alpha) const
     {
         const Vec8f cos2_lobe_in = cos_lobe_in * cos_lobe_in;
-        const Vec8f sin2_lobe_in = Vec8f(1.0f) - cos2_lobe_in;
+        const Vec8f sin2_lobe_in = One_SIMD - cos2_lobe_in;
         const Vec8f alpha2 = alpha * alpha;
 
         Vec8f factor = cos2_lobe_in + sin2_lobe_in / alpha2;
         factor *= factor;
-        factor *= Vec8f(M_PI) * alpha2;
-        const Vec8f Zero(0.0f);
-        return select(factor == Zero, Zero, weight / factor);
+        factor *= PI_SIMD * alpha2;
+        return select(factor == Zero_SIMD, Zero_SIMD, weight / factor);
     }
 
     inline float ggx_lobe_incoming(const float cos_lobe_in, const float weight, const float alpha) const
@@ -122,48 +159,41 @@ class BSDFProxy
     inline Vec8f evaluate_simd(
             const Vec8f &incoming_x, const Vec8f &incoming_y, const Vec8f &incoming_z, const Vec8f& diffuse_cosines, const Vec8f& reflection_cosines) const
     {
-        Vec8f value(0.0f);
-        const Vec8f normal_x(m_normal.x);
-        const Vec8f normal_y(m_normal.y);
-        const Vec8f normal_z(m_normal.z);
-        const Vec8f cos_ni = min(dot_simd(normal_x, normal_y, normal_z, incoming_x, incoming_y, incoming_z) + diffuse_cosines, Vec8f(1.0f));
+        Vec8f value(Zero_SIMD);
+        // const Vec8f cos_ni = min(dot_simd(normal_x, normal_y, normal_z, incoming_x, incoming_y, incoming_z) + diffuse_cosines, Vec8f(1.0f));
+        const Vec8f cos_ni = dot_simd(m_normal_x, m_normal_y, m_normal_z, incoming_x, incoming_y, incoming_z);
         const Vec8f cos_negni = -cos_ni;
 
         if (m_is_diffuse)
         {
-            value += Vec8f(m_diffuse_weight) * max(cos_ni, Vec8f(0.0f));
+            value += m_diffuse_weight_SIMD * max(cos_ni, Zero_SIMD);
         }
         if (m_is_translucent)
         {
-            value += Vec8f(m_translucency_weight) * max(cos_negni, Vec8f(0.0f));
+            value += m_translucency_weight_SIMD * max(cos_negni, Zero_SIMD);
         }
-        auto mask = cos_ni > Vec8f(0.0f);
+        auto mask = cos_ni > Zero_SIMD;
         if (m_is_reflective && !horizontal_and(~mask))
         {
-            const Vec8f reflection_lobe_x(m_reflection_lobe.x);
-            const Vec8f reflection_lobe_y(m_reflection_lobe.y);
-            const Vec8f reflection_lobe_z(m_reflection_lobe.z);
-            const Vec8f cos_refl_i = min(dot_simd(reflection_lobe_x, reflection_lobe_y, reflection_lobe_z, incoming_x, incoming_y, incoming_z) + reflection_cosines, Vec8f(1.0f));
+            // const Vec8f cos_refl_i = min(dot_simd(reflection_lobe_x, reflection_lobe_y, reflection_lobe_z, incoming_x, incoming_y, incoming_z) + reflection_cosines, Vec8f(1.0f));
+            const Vec8f cos_refl_i = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, incoming_x, incoming_y, incoming_z);
 
-            mask = mask & (cos_refl_i > Vec8f(0.0f));
+            mask = mask & (cos_refl_i > Zero_SIMD);
             if (!horizontal_and(~mask))
             {
-                value = if_add(mask, value, ggx_lobe_incoming_simd(cos_refl_i, Vec8f(m_reflection_weight), Vec8f(m_reflection_roughness)));
+                value = if_add(mask, value, ggx_lobe_incoming_simd(cos_refl_i, m_reflection_weight_SIMD, m_reflection_roughness_SIMD));
             }
         }
         if (m_is_refractive)
         {
-            const Vec8f refraction_lobe_x(m_refraction_lobe.x);
-            const Vec8f refraction_lobe_y(m_refraction_lobe.y);
-            const Vec8f refraction_lobe_z(m_refraction_lobe.z);
-            const Vec8f cos_refr_i = dot_simd(refraction_lobe_x, refraction_lobe_y, refraction_lobe_z, incoming_x, incoming_y, incoming_z);
+            const Vec8f cos_refr_i = dot_simd(m_refraction_lobe_x, m_refraction_lobe_y, m_refraction_lobe_z, incoming_x, incoming_y, incoming_z);
 
-            auto mask = cos_refr_i > Vec8f(0.0f);
-            mask = mask & ((dot_simd(refraction_lobe_x, refraction_lobe_y, refraction_lobe_z, normal_x, normal_y, normal_z)
-                            * dot_simd(incoming_x, incoming_y, incoming_z, normal_x, normal_y, normal_z)) > Vec8f(0.0001f));
+            auto mask = cos_refr_i > Zero_SIMD;
+            mask = mask & ((dot_simd(m_refraction_lobe_x, m_refraction_lobe_y, m_refraction_lobe_z, m_normal_x, m_normal_y, m_normal_z)
+                            * dot_simd(incoming_x, incoming_y, incoming_z, m_normal_x, m_normal_y, m_normal_z)) > Epsilon_SIMD);
             if (!horizontal_and(~mask))
             {
-                value = if_add(mask, value, ggx_lobe_incoming_simd(cos_refr_i, Vec8f(m_refraction_weight), Vec8f(m_refraction_roughness)));
+                value = if_add(mask, value, ggx_lobe_incoming_simd(cos_refr_i, m_refraction_weight_SIMD, m_refraction_roughness_SIMD));
             }
         }
 
@@ -224,6 +254,12 @@ private:
     Vector3f m_normal;
     Vector3f m_reflection_lobe;
     Vector3f m_refraction_lobe;
+
+    Vec8f m_normal_x, m_normal_y, m_normal_z;
+    Vec8f m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z;
+    Vec8f m_refraction_lobe_x, m_refraction_lobe_y, m_refraction_lobe_z;
+    Vec8f m_diffuse_weight_SIMD, m_reflection_weight_SIMD, m_refraction_weight_SIMD, m_translucency_weight_SIMD;
+    Vec8f m_reflection_roughness_SIMD, m_refraction_roughness_SIMD;
 };
 
 MTS_NAMESPACE_END

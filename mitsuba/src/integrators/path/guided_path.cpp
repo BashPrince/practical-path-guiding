@@ -33,10 +33,24 @@
 #include <sstream>
 
 #include <immintrin.h>
-#include <mitsuba/productguiding/vcl-v1/vectorclass.h>
-#include <mitsuba/productguiding/vcl-v1/vectormath_trig.h>
+#include <mitsuba/productguiding/vcl-v2/vectorclass.h>
+#include <mitsuba/productguiding/vcl-v2/vectormath_trig.h>
 
 #include <mutex>
+
+#define BUILD_SIMD_PRODUCT
+#define PROXYWIDTH 16
+#define LOAD_INCOMING_ARRAY
+
+#ifdef LOAD_INCOMING_ARRAY
+#if PROXYWIDTH == 16
+    #include <mitsuba/productguiding/proxyarrays_16.h>
+#elif PROXYWIDTH == 8
+    #include <mitsuba/productguiding/proxyarrays_8.h>
+#else
+    #error(ProxyWidth neither 8 nor 16)
+#endif
+#endif
 
 MTS_NAMESPACE_BEGIN
 
@@ -85,20 +99,6 @@ inline Vector canonicalToDir(Point2 p)
     return {sinTheta * cosPhi, sinTheta * sinPhi, cosTheta};
 }
 
-inline void canonicalToDir_simd(const Vec8f& p_x, const Vec8f& p_y, Vec8f& outDir_x, Vec8f& outDir_y, Vec8f& outDir_z)
-{
-    const Vec8f cosTheta = Vec8f(2.0f) * p_x - Vec8f(1.0f);
-    const Vec8f phi = Vec8f(2.0f) * Vec8f(M_PI) * p_y;
-
-    const Vec8f sinTheta = sqrt(Vec8f(1.0f) - cosTheta * cosTheta);
-    Vec8f cosPhi;
-    const Vec8f sinPhi = sincos(&cosPhi, phi);
-
-    outDir_x = sinTheta * cosPhi;
-    outDir_y = sinTheta * sinPhi;
-    outDir_z = cosTheta;
-}
-
 inline Point2 dirToCanonical(const Vector &d)
 {
     if (!std::isfinite(d.x) || !std::isfinite(d.y) || !std::isfinite(d.z))
@@ -114,110 +114,121 @@ inline Point2 dirToCanonical(const Vector &d)
     return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
 }
 
-alignas(32) float worldDir_x[16 * 16] = 
-{0.3412988484,
-0.5717597604, 0.7122309804, 0.8109106421, 0.8819402456, 0.9316653609, 0.9633906484, 0.9788678288, 0.9788678288,
-0.9633906484, 0.9316653609, 0.8819402456, 0.8109106421, 0.7122309804, 0.5717597604, 0.3412988484, 0.2893391550,
-0.4847145081, 0.6038002372, 0.6874568462, 0.7476727962, 0.7898277044, 0.8167231083, 0.8298440576, 0.8298440576,
-0.8167231083, 0.7898277044, 0.7476727962, 0.6874568462, 0.6038002372, 0.4847145081, 0.2893391550, 0.1933302432,
-0.3238758743, 0.4034463763, 0.4593439400, 0.4995789528, 0.5277459621, 0.5457169414, 0.5544840097, 0.5544840097,
-0.5457169414, 0.5277459621, 0.4995789528, 0.4593439400, 0.4034463763, 0.3238758743, 0.1933302432, 0.0678885281,
-0.1137300357, 0.1416714787, 0.1613000780, 0.1754287332, 0.1853196770, 0.1916302294, 0.1947088242, 0.1947088242,
-0.1916302294, 0.1853196770, 0.1754287332, 0.1613000780, 0.1416714787, 0.1137300357, 0.0678885281, -0.0678885579,
--0.1137300879, -0.1416715384, -0.1613001525, -0.1754288226, -0.1853197515, -0.1916303188, -0.1947089136, -0.1947089136,
--0.1916303188, -0.1853197515, -0.1754288226, -0.1613001525, -0.1416715384, -0.1137300879, -0.0678885579, -0.1933303028,
--0.3238759637, -0.4034465253, -0.4593440890, -0.4995791018, -0.5277461410, -0.5457170606, -0.5544841886, -0.5544841886,
--0.5457170606, -0.5277461410, -0.4995791018, -0.4593440890, -0.4034465253, -0.3238759637, -0.1933303028, -0.2893391848,
--0.4847145379, -0.6038002372, -0.6874568462, -0.7476728559, -0.7898277640, -0.8167231679, -0.8298441172, -0.8298441172,
--0.8167231679, -0.7898277640, -0.7476728559, -0.6874568462, -0.6038002372, -0.4847145379, -0.2893391848, -0.3412988484,
--0.5717597604, -0.7122309804, -0.8109106421, -0.8819402456, -0.9316653609, -0.9633906484, -0.9788678288, -0.9788678288,
--0.9633906484, -0.9316653609, -0.8819402456, -0.8109106421, -0.7122309804, -0.5717597604, -0.3412988484, -0.3412988186,
--0.5717597604, -0.7122309208, -0.8109105825, -0.8819401860, -0.9316653013, -0.9633905888, -0.9788677692, -0.9788677692,
--0.9633905888, -0.9316653013, -0.8819401860, -0.8109105825, -0.7122309208, -0.5717597604, -0.3412988186, -0.2893391550,
--0.4847144783, -0.6038001776, -0.6874567866, -0.7476727366, -0.7898276448, -0.8167230487, -0.8298439980, -0.8298439980,
--0.8167230487, -0.7898276448, -0.7476727366, -0.6874567866, -0.6038001776, -0.4847144783, -0.2893391550, -0.1933301836,
--0.3238757551, -0.4034462571, -0.4593437910, -0.4995788038, -0.5277457833, -0.5457167625, -0.5544838309, -0.5544838309,
--0.5457167625, -0.5277457833, -0.4995788038, -0.4593437910, -0.4034462571, -0.3238757551, -0.1933301836, -0.0678885803,
--0.1137301251, -0.1416715831, -0.1613001972, -0.1754288673, -0.1853198111, -0.1916303784, -0.1947089732, -0.1947089732,
--0.1916303784, -0.1853198111, -0.1754288673, -0.1613001972, -0.1416715831, -0.1137301251, -0.0678885803, 0.0678885877,
-0.1137301400, 0.1416716129, 0.1613002270, 0.1754288971, 0.1853198409, 0.1916304082, 0.1947090030, 0.1947090030,
-0.1916304082, 0.1853198409, 0.1754288971, 0.1613002270, 0.1416716129, 0.1137301400, 0.0678885877, 0.1933303177,
-0.3238759935, 0.4034465551, 0.4593441188, 0.4995791614, 0.5277462006, 0.5457171202, 0.5544842482, 0.5544842482,
-0.5457171202, 0.5277462006, 0.4995791614, 0.4593441188, 0.4034465551, 0.3238759935, 0.1933303177, 0.2893391550,
-0.4847144783, 0.6038001776, 0.6874567866, 0.7476727366, 0.7898276448, 0.8167230487, 0.8298439980, 0.8298439980,
-0.8167230487, 0.7898276448, 0.7476727366, 0.6874567866, 0.6038001776, 0.4847144783, 0.2893391550, 0.3412988484,
-0.5717597604, 0.7122309804, 0.8109106421, 0.8819402456, 0.9316653609, 0.9633906484, 0.9788678288, 0.9788678288,
-0.9633906484, 0.9316653609, 0.8819402456, 0.8109106421, 0.7122309804, 0.5717597604, 0.3412988484};
+inline void canonicalToDir_simd(const Vec8f &p_x, const Vec8f &p_y, Vec8f &outDir_x, Vec8f &outDir_y, Vec8f &outDir_z)
+{
+    const Vec8f cosTheta = Two_SIMD * p_x - One_SIMD;
+    const Vec8f phi = Two_SIMD * Vec8f(M_PI) * p_y;
 
-alignas(32) float worldDir_y[16 * 16] = 
-{0.0678885579,
-0.1137300879, 0.1416715384, 0.1613001525, 0.1754288226, 0.1853197515, 0.1916303188, 0.1947089136, 0.1947089136,
-0.1916303188, 0.1853197515, 0.1754288226, 0.1613001525, 0.1416715384, 0.1137300879, 0.0678885579, 0.1933302581,
-0.3238759041, 0.4034464359, 0.4593439698, 0.4995790124, 0.5277460217, 0.5457170010, 0.5544840693, 0.5544840693,
-0.5457170010, 0.5277460217, 0.4995790124, 0.4593439698, 0.4034464359, 0.3238759041, 0.1933302581, 0.2893391848,
-0.4847145379, 0.6038002372, 0.6874568462, 0.7476728559, 0.7898277640, 0.8167231679, 0.8298441172, 0.8298441172,
-0.8167231679, 0.7898277640, 0.7476728559, 0.6874568462, 0.6038002372, 0.4847145379, 0.2893391848, 0.3412988484,
-0.5717597604, 0.7122309804, 0.8109106421, 0.8819402456, 0.9316653609, 0.9633906484, 0.9788678288, 0.9788678288,
-0.9633906484, 0.9316653609, 0.8819402456, 0.8109106421, 0.7122309804, 0.5717597604, 0.3412988484, 0.3412988484,
-0.5717597604, 0.7122309804, 0.8109106421, 0.8819402456, 0.9316653609, 0.9633906484, 0.9788678288, 0.9788678288,
-0.9633906484, 0.9316653609, 0.8819402456, 0.8109106421, 0.7122309804, 0.5717597604, 0.3412988484, 0.2893391550,
-0.4847144783, 0.6038001776, 0.6874567866, 0.7476727366, 0.7898276448, 0.8167230487, 0.8298439980, 0.8298439980,
-0.8167230487, 0.7898276448, 0.7476727366, 0.6874567866, 0.6038001776, 0.4847144783, 0.2893391550, 0.1933302432,
-0.3238758743, 0.4034463763, 0.4593439400, 0.4995789528, 0.5277459621, 0.5457169414, 0.5544840097, 0.5544840097,
-0.5457169414, 0.5277459621, 0.4995789528, 0.4593439400, 0.4034463763, 0.3238758743, 0.1933302432, 0.0678885505,
-0.1137300804, 0.1416715384, 0.1613001376, 0.1754288077, 0.1853197366, 0.1916303039, 0.1947088987, 0.1947088987,
-0.1916303039, 0.1853197366, 0.1754288077, 0.1613001376, 0.1416715384, 0.1137300804, 0.0678885505, -0.0678886175,
--0.1137301847, -0.1416716576, -0.1613002867, -0.1754289567, -0.1853199154, -0.1916304827, -0.1947090775, -0.1947090775,
--0.1916304827, -0.1853199154, -0.1754289567, -0.1613002867, -0.1416716576, -0.1137301847, -0.0678886175, -0.1933302879,
--0.3238759339, -0.4034464657, -0.4593440294, -0.4995790720, -0.5277460814, -0.5457170606, -0.5544841290, -0.5544841290,
--0.5457170606, -0.5277460814, -0.4995790720, -0.4593440294, -0.4034464657, -0.3238759339, -0.1933302879, -0.2893392444,
--0.4847146273, -0.6038003564, -0.6874569654, -0.7476729751, -0.7898278832, -0.8167232871, -0.8298442364, -0.8298442364,
--0.8167232871, -0.7898278832, -0.7476729751, -0.6874569654, -0.6038003564, -0.4847146273, -0.2893392444, -0.3412988484,
--0.5717597604, -0.7122309804, -0.8109106421, -0.8819402456, -0.9316653609, -0.9633906484, -0.9788678288, -0.9788678288,
--0.9633906484, -0.9316653609, -0.8819402456, -0.8109106421, -0.7122309804, -0.5717597604, -0.3412988484, -0.3412988186,
--0.5717597604, -0.7122309208, -0.8109105825, -0.8819401860, -0.9316653013, -0.9633905888, -0.9788677692, -0.9788677692,
--0.9633905888, -0.9316653013, -0.8819401860, -0.8109105825, -0.7122309208, -0.5717597604, -0.3412988186, -0.2893391252,
--0.4847144485, -0.6038001180, -0.6874567270, -0.7476726770, -0.7898275852, -0.8167229891, -0.8298439384, -0.8298439384,
--0.8167229891, -0.7898275852, -0.7476726770, -0.6874567270, -0.6038001180, -0.4847144485, -0.2893391252, -0.1933302879,
--0.3238759339, -0.4034464657, -0.4593440294, -0.4995790720, -0.5277460814, -0.5457170606, -0.5544841290, -0.5544841290,
--0.5457170606, -0.5277460814, -0.4995790720, -0.4593440294, -0.4034464657, -0.3238759339, -0.1933302879, -0.0678885207,
--0.1137300283, -0.1416714638, -0.1613000631, -0.1754287183, -0.1853196621, -0.1916302145, -0.1947088093, -0.1947088093,
--0.1916302145, -0.1853196621, -0.1754287183, -0.1613000631, -0.1416714638, -0.1137300283, -0.0678885207};
+    const Vec8f sinTheta = sqrt(One_SIMD - cosTheta * cosTheta);
+    Vec8f cosPhi;
+    const Vec8f sinPhi = sincos(&cosPhi, phi);
 
-alignas(32) float worldDir_z[16 * 16] = 
-{-0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000, -0.9375000000,
--0.8125000000, -0.6875000000, -0.5625000000, -0.4375000000, -0.3125000000, -0.1875000000, -0.0625000000, 0.0625000000,
-0.1875000000, 0.3125000000, 0.4375000000, 0.5625000000, 0.6875000000, 0.8125000000, 0.9375000000};
+    outDir_x = sinTheta * cosPhi;
+    outDir_y = sinTheta * sinPhi;
+    outDir_z = cosTheta;
+}
+
+void make_incoming_arrays(const size_t ProxyWidth)
+{
+    std::vector<Vector3f> incoming_dirs(ProxyWidth * ProxyWidth);
+
+    const float inv_width = 1.0f / ProxyWidth;
+    for (size_t y = 0; y < ProxyWidth; ++y)
+    {
+        for (size_t x = 0; x < ProxyWidth; ++x)
+        {
+            const Point2u pixel(x, y);
+            const Point2f cylindrical_direction(
+                (x + 0.5f) * inv_width,
+                (y + 0.5f) * inv_width);
+
+            const Vector3f incoming = canonicalToDir(cylindrical_direction);
+            const size_t index = pixel.y * ProxyWidth + pixel.x;
+            incoming_dirs[index] = incoming;
+        }
+    }
+
+    // Save AoS arrays
+    std::string filename_base = "/mnt/Data/_Programming/PracticalPathGuiding/WorldDir_";
+    filename_base += std::to_string(ProxyWidth) + "_";
+
+    std::ofstream file_x(filename_base + "x");
+    std::ofstream file_y(filename_base + "y");
+    std::ofstream file_z(filename_base + "z");
+    file_x << std::setprecision(8) << "{\n";
+    file_y << std::setprecision(8) << "{\n";
+    file_z << std::setprecision(8) << "{\n";
+
+    for (size_t y = 0; y < ProxyWidth; ++y)
+    {
+        for (size_t x = 0; x < ProxyWidth; ++x)
+        {
+            const Point2u pixel(x, y);
+            const size_t index = pixel.y * ProxyWidth + pixel.x;
+            file_x << incoming_dirs[index].x << ", ";
+            file_y << incoming_dirs[index].y << ", ";
+            file_z << incoming_dirs[index].z << ", ";
+        }
+        file_x << "\n";
+        file_y << "\n";
+        file_z << "\n";
+    }
+    file_x << "}";
+    file_y << "}";
+    file_z << "}";
+    file_x.close();
+    file_y.close();
+    file_z.close();
+
+    // Save SoA array
+    std::ofstream file_soa(filename_base + "SoA");
+    file_soa << std::setprecision(8) << "{\n";
+
+    for (size_t y = 0; y < ProxyWidth; ++y)
+    {
+        for (size_t x = 0; x < ProxyWidth; x += 8)
+        {
+            const Point2u pixel(x, y);
+            const size_t index = pixel.y * ProxyWidth + pixel.x;
+
+            for (size_t i = 0; i < 8; ++i)
+                file_soa << incoming_dirs[index + i].x << ", ";
+            
+            file_soa << "\n";
+            
+            for (size_t i = 0; i < 8; ++i)
+                file_soa << incoming_dirs[index + i].y << ", ";
+            
+            file_soa << "\n";
+
+            for (size_t i = 0; i < 8; ++i)
+                file_soa << incoming_dirs[index + i].z << ", ";
+            
+            file_soa << "\n";
+        }
+    }
+    file_soa << "}";
+    file_soa.close();
+
+    // Save scalar array
+    std::ofstream file_scalar(filename_base + "scalar");
+    file_scalar << std::setprecision(8) << "{\n";
+
+    for (size_t y = 0; y < ProxyWidth; ++y)
+    {
+        for (size_t x = 0; x < ProxyWidth; ++x)
+        {
+            const Point2u pixel(x, y);
+            const size_t index = pixel.y * ProxyWidth + pixel.x;
+            file_scalar << incoming_dirs[index].x << ", ";
+            file_scalar << incoming_dirs[index].y << ", ";
+            file_scalar << incoming_dirs[index].z << ", ";
+            file_scalar << "\n";
+        }
+    }
+    file_scalar << "}";
+    file_scalar.close();
+}
 
 alignas(32) float cosines[256 * 256];
 bool cosines_loaded = false;
@@ -403,6 +414,11 @@ public:
         const Vector3f &outgoing,
         const Vector3f &shading_normal);
 
+    void build_product_scalar(
+        BSDFProxy &bsdf_proxy,
+        const Vector3f &outgoing,
+        const Vector3f &shading_normal);
+
     void build_product_simd(
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
@@ -422,111 +438,82 @@ public:
 
     bool is_built() const;
 
-    static const size_t ProxyWidth = 16;
-
-    alignas(32) std::array<float, ProxyWidth * ProxyWidth> m_map;
-
-    std::shared_ptr<
-        std::array<const QuadTreeNode *, ProxyWidth * ProxyWidth>>
-        m_quadtree_strata;
+    static const size_t ProxyWidth = PROXYWIDTH;
 
     template <size_t Width>
     class ImageImportanceSampler
     {
     public:
-        void build(std::array<float, Width * Width>& func)
+        void build()
         {
-            float marginalSum = 0.0f;
+            // SIMD version
+#ifdef BUILD_SIMD_PRODUCT
+            float marginal_sum = 0.0f;
+            size_t start_index = (Width - 1) * Width;
 
-            for (size_t y = 0; y < Width; ++y)
+            for (size_t i = 0; i < Width; ++i)
             {
-                std::array<float, Width>& conditionalDistribution = conditionalDistributions[y];
-                float sum = 0.0f;
-
-                for (size_t x = 0; x < Width; ++x)
-                {
-                    const size_t index = y * Width + x;
-                    if (func[index] > 0.0f)
-                        sum += func[index];
-                    conditionalDistribution[x] = sum;
-                }
-                const float invSum = sum <= 0.0f ? 0.0f : 1.0f / sum;
-                for (auto& c : conditionalDistribution)
-                    c *= invSum;
-                
-                conditionalDistribution[Width - 1] = 1.0f;
-                
-                marginalSum += sum;
-                marginalDistribution[y] = marginalSum;
+                marginal_sum += distribution[start_index + i];
+                marginalDistribution[i] = marginal_sum;
             }
 
-            const float invMarginalSum = marginalSum <= 0.0f ? 0.0f : 1.0f / marginalSum;
-            for (auto& m : marginalDistribution)
-                m *= invMarginalSum;
-
-            marginalDistribution[Width - 1] = 1.0f;
-
-            if (marginalSum <= 0.0f)
-            {
+            totalRadiance = marginalDistribution[Width - 1];
+            if (totalRadiance <= 0.0f)
                 isZero = true;
-            }
-            else
+#else
+
+            // Scalar version
+            float marginal_sum = 0.0f;
+            size_t start_index = Width - 1;
+
+            for (size_t i = 0; i < Width; ++i)
             {
-                for (size_t y = 0; y < Width; ++y)
-                    for (size_t x = 0; x < Width; ++x)
-                    {
-                        const size_t index = y * Width + x;
-                        discretePdf[index] = func[index] * invMarginalSum;
-                    }
+                marginal_sum += distribution[start_index + i * Width];
+                marginalDistribution[i] = marginal_sum;
             }
+
+            totalRadiance = marginalDistribution[Width - 1];
+            if (totalRadiance <= 0.0f)
+                isZero = true;
+#endif
         }
 
-        float sample(const Point2 &s, Point2u &pixel) const
+        void sample(const Point2 &s, Point2u &pixel) const
         {
             if (isZero)
             {
                 pixel.x = (unsigned int)(s.x * Width);
                 pixel.y = (unsigned int)(s.y * Width);
-                return 1.0f / (Width * Width);
             }
-
+#ifdef BUILD_SIMD_PRODUCT
+            const float s_x_scaled = s.x * totalRadiance;
             size_t x = 0;
-            while (s.x > marginalDistribution[x])
+            while (s_x_scaled > marginalDistribution[x])
                 ++x;
 
             assert(x < Width);
 
             size_t y = 0;
-            while (s.y > distribution[y * Width + x])
+            const float s_y_scaled = s.y * distribution[(Width - 1) * Width + x];
+            while (s_y_scaled > distribution[y * Width + x])
                 ++y;
-            // size_t y = 0;
-            // while (s.y > marginalDistribution[y])
-            //     ++y;
+#else
+            const float s_y_scaled = s.y * totalRadiance;
+            size_t y = 0;
+            while (s_y_scaled > marginalDistribution[y])
+                ++y;
 
-            // assert(y < Width);
-            // const std::array<float, Width> &conditionalDistribution = conditionalDistributions[y];
+            assert(y < Width);
 
-            // size_t x = 0;
-            // while (s.x > conditionalDistribution[x])
-            //     ++x;
+            size_t x = 0;
+            const size_t row_index = y * Width;
+            const float s_x_scaled = s.x * distribution[row_index + Width - 1];
+            while (s_x_scaled > distribution[row_index + x])
+                ++x;
+#endif
             
-
-            const size_t index = y * Width + x;
             pixel.x = x;
             pixel.y = y;
-            return discretePdf[index];
-        }
-
-        float pdf(const Point2u &pixel) const
-        {
-            if (isZero)
-                return 1.0f / (Width * Width);
-            
-            assert(pixel.x < ProxyWidth);
-            assert(pixel.y < ProxyWidth);
-
-            const size_t index = pixel.y * Width + pixel.x;
-            return discretePdf[index];
         }
 
         float* get_distribution()
@@ -534,30 +521,30 @@ public:
             return distribution.data();
         }
 
-        float* get_marginal_distribution()
+        inline float get_total_radiance() const
         {
-            return marginalDistribution.data();
+            return totalRadiance;
         }
 
-        float* get_discrete_pdf()
+        inline bool is_zero() const
         {
-            return discretePdf.data();
-        }
-
-        void set_to_zero()
-        {
-            isZero = true;
+            return isZero;
         }
 
     private:
-        alignas(32) std::array<float, Width> marginalDistribution;
-        std::array<std::array<float, Width>, Width> conditionalDistributions;
-        alignas(32) std::array<float, Width * Width> discretePdf;
-        alignas(32) std::array<float, Width * Width> distribution;
+        std::array<float, PROXYWIDTH> marginalDistribution;
+        std::array<float, PROXYWIDTH * PROXYWIDTH> distribution;
+        float totalRadiance;
         bool isZero = false;
     };
 
-    ImageImportanceSampler<ProxyWidth> m_image_importance_sampler;
+    ImageImportanceSampler<PROXYWIDTH> m_image_importance_sampler;
+
+    std::array<float, PROXYWIDTH * PROXYWIDTH> m_map;
+
+    std::shared_ptr<
+        std::array<const QuadTreeNode *, PROXYWIDTH * PROXYWIDTH>>
+        m_quadtree_strata;
 
     bool m_product_is_built;
     bool m_is_built;
@@ -869,7 +856,7 @@ void RadianceProxy::build(
     const float radiance_scale)
 {
     m_quadtree_nodes = quadtree_nodes;
-    m_quadtree_strata = std::make_shared<std::array<const QuadTreeNode *, ProxyWidth * ProxyWidth>>();
+    m_quadtree_strata = std::make_shared<std::array<const QuadTreeNode *, PROXYWIDTH * PROXYWIDTH>>();
 
     size_t end_level = 0;
     size_t map_width = ProxyWidth;
@@ -895,46 +882,8 @@ void RadianceProxy::build(
     m_is_built = true;
 }
 
-void RadianceProxy::build_product(
-    BSDFProxy &bsdf_proxy,
-    const Vector3f &outgoing,
-    const Vector3f &shading_normal)
-{
-    build_product_simd(
-        bsdf_proxy,
-        outgoing,
-        shading_normal);
-        
-    // assert(m_is_built);
-
-    // if (m_product_is_built)
-    //     return;
-
-    // bsdf_proxy.finish_parameterization(outgoing, shading_normal);
-    // m_product_is_built = true;
-
-    // const float inv_width = 1.0f / ProxyWidth;
-    // for (size_t y = 0; y < ProxyWidth; ++y)
-    // {
-    //     for (size_t x = 0; x < ProxyWidth; ++x)
-    //     {
-    //         const Point2u pixel(x, y);
-    //         const Point2f cylindrical_direction(
-    //             (x + 0.5f) * inv_width,
-    //             (y + 0.5f) * inv_width);
-
-    //         const Vector3f incoming = canonicalToDir(cylindrical_direction);
-
-    //         const size_t index = pixel.y * ProxyWidth + pixel.x;
-    //         m_map[index] *= bsdf_proxy.evaluate(incoming);
-    //     }
-    // }
-    // // Build discrete 2D distribution
-    // m_image_importance_sampler.build(m_map);
-}
-
 // Return cos theta of v to boundary in direction dest
-float cos_theta_to_boundary(const Point2u& p, const Point2u& dest, const float ProxyWidth)
+float cos_theta_to_boundary(const Point2u &p, const Point2u &dest, const float ProxyWidth)
 {
     if (p == dest)
         return 1.0f;
@@ -976,8 +925,63 @@ float cos_theta_to_boundary(const Point2u& p, const Point2u& dest, const float P
         currentPixel.x = std::min(currentPixel.x, static_cast<unsigned int>(ProxyWidth - 1));
         currentPixel.y = std::min(currentPixel.y, static_cast<unsigned int>(ProxyWidth - 1));
     }
-    
+
     return dot(destination, normalize(current)) - dot(destination, incoming);
+}
+
+void RadianceProxy::build_product(
+    BSDFProxy &bsdf_proxy,
+    const Vector3f &outgoing,
+    const Vector3f &shading_normal)
+{
+#ifdef BUILD_SIMD_PRODUCT
+    build_product_simd(bsdf_proxy, outgoing, shading_normal);
+#else
+    build_product_scalar(bsdf_proxy, outgoing, shading_normal);
+#endif
+}
+
+void RadianceProxy::build_product_scalar(
+    BSDFProxy& bsdf_proxy,
+    const Vector3f& outgoing,
+    const Vector3f& shading_normal)
+{
+    assert(m_is_built);
+
+    if (m_product_is_built)
+        return;
+
+    bsdf_proxy.finish_parameterization(outgoing, shading_normal);
+    m_product_is_built = true;
+
+    float *distribution = m_image_importance_sampler.get_distribution();
+
+    const float inv_width = 1.0f / ProxyWidth;
+    for (size_t y = 0; y < ProxyWidth; ++y)
+    {
+        float distribution_sum = 0.0f;
+        for (size_t x = 0; x < ProxyWidth; ++x)
+        {
+            const Point2u pixel(x, y);
+            const size_t index = pixel.y * ProxyWidth + pixel.x;
+            
+#ifdef LOAD_INCOMING_ARRAY
+            const Vector3f incoming(worldDir_scalar[3 * index], worldDir_scalar[3 * index + 1], worldDir_scalar[3 * index + 2]);
+#else
+            const Point2f cylindrical_direction(
+                (x + 0.5f) * inv_width,
+                (y + 0.5f) * inv_width);
+            const Vector3f incoming = canonicalToDir(cylindrical_direction);
+#endif
+
+            const float product = m_map[index] * bsdf_proxy.evaluate(incoming);
+            m_map[index] = product;
+            distribution_sum += product;
+            distribution[index] = distribution_sum;
+        }
+    }
+    // Build discrete 2D distribution
+    m_image_importance_sampler.build();
 }
 
 void RadianceProxy::build_product_simd(
@@ -997,43 +1001,38 @@ void RadianceProxy::build_product_simd(
     const Vec8i simd_loop_offsets(0, 1, 2, 3, 4, 5, 6, 7);
 
     float* distribution = m_image_importance_sampler.get_distribution();
-    float* marginal_distribution = m_image_importance_sampler.get_marginal_distribution();
-    float* discrete_pdf = m_image_importance_sampler.get_discrete_pdf();
 
-    Vec8f distribution_sum_left(0.0f);
-    Vec8f distribution_sum_right(0.0f);
+    Vec8f distribution_sum_left(Zero_SIMD);
+    Vec8f distribution_sum_right(Zero_SIMD);
 
-    if (!cosines_loaded)
-    {
-        std::lock_guard<std::mutex> guard(cosine_mutex);
+    // if (!cosines_loaded)
+    // {
+    //     std::lock_guard<std::mutex> guard(cosine_mutex);
 
-        if(!cosines_loaded)
-        {
-            char* data = reinterpret_cast<char*>(cosines);
-            std::ifstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::in | std::ios::binary);
-            file.read(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
-            file.close();
+    //     if(!cosines_loaded)
+    //     {
+    //         char* data = reinterpret_cast<char*>(cosines);
+    //         std::ifstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::in | std::ios::binary);
+    //         file.read(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
+    //         file.close();
 
-            cosines_loaded = true;
-        }
-    }
+    //         cosines_loaded = true;
+    //     }
+    // }
 
-    Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
-    bsdf_proxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
+    // Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
+    // bsdf_proxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
 
-    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(ProxyWidth);
-    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(ProxyWidth);
+    // Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(ProxyWidth);
+    // Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(ProxyWidth);
 
-    Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
-    Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
+    // Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
+    // Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
 
-    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), ProxyWidth - 1);
-    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), ProxyWidth - 1);
-    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), ProxyWidth - 1);
-    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), ProxyWidth - 1);
-
-    const float* diffuse_cosines_array = &cosines[(diffuse_pixel.y * ProxyWidth + diffuse_pixel.x) * ProxyWidth * ProxyWidth];
-    const float* reflectance_cosines_array = &cosines[(reflectance_pixel.y * ProxyWidth + reflectance_pixel.x) * ProxyWidth * ProxyWidth];
+    // diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), ProxyWidth - 1);
+    // diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), ProxyWidth - 1);
+    // reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), ProxyWidth - 1);
+    // reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), ProxyWidth - 1);
 
     for (size_t y = 0; y < ProxyWidth; ++y)
     {
@@ -1042,39 +1041,39 @@ void RadianceProxy::build_product_simd(
         for (size_t x = 0; x < ProxyWidth; x += 8)
         {
             const Vec8i pixel_x = Vec8i(x) + simd_loop_offsets;
-            const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
-            const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
 
             const size_t index = y * ProxyWidth + x;
 
             Vec8f incoming_x, incoming_y, incoming_z;
-            incoming_x.load_a(&worldDir_x[index]);
-            incoming_y.load_a(&worldDir_y[index]);
-            incoming_z.load_a(&worldDir_z[index]);
 
-            // canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
-
-            Vec8f diffuse_cosines(0.0f), reflectance_cosines(0.0f);
+#ifdef LOAD_INCOMING_ARRAY
+            incoming_x.load_a(worldDir_soa + (index * 3));
+            incoming_y.load_a(worldDir_soa + (index * 3 + 8));
+            incoming_z.load_a(worldDir_soa + (index * 3 + 2 * 8));
+#else
+            const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
+            const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
+            canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
+#endif
             // Vec8f diffuse_cosines, reflectance_cosines;
             // diffuse_cosines.load_a(&diffuse_cosines_array[index]);
             // reflectance_cosines.load_a(&reflectance_cosines_array[index]);
 
-            const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z, diffuse_cosines, reflectance_cosines);
+            const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z, Zero_SIMD, Zero_SIMD);
             Vec8f radiance;
-            radiance.load_a(&m_map[index]);
+            radiance.load(&m_map[index]);
             radiance *= bsdf_proxy_value;
-            radiance.store_a(&m_map[index]);
+            radiance.store(&m_map[index]);
 
-            const Vec8f Zero(0.0f);
             if (x == 0)
             {
-                distribution_sum_left += select(radiance > Zero, radiance, Zero);
-                distribution_sum_left.store_a(&distribution[index]);
+                distribution_sum_left += select(radiance > Zero_SIMD, radiance, Zero_SIMD);
+                distribution_sum_left.store(&distribution[index]);
             }
             else
             {
-                distribution_sum_right += select(radiance > Zero, radiance, Zero);
-                distribution_sum_right.store_a(&distribution[index]);
+                distribution_sum_right += select(radiance > Zero_SIMD, radiance, Zero_SIMD);
+                distribution_sum_right.store(&distribution[index]);
             }
         }
     }
@@ -1112,81 +1111,7 @@ void RadianceProxy::build_product_simd(
     // file.write(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
     // file.close();
 
-    const float *conditional_sums = &distribution[(ProxyWidth - 1) * ProxyWidth];
-    float marginal_sum = 0.0f;
-
-    for (size_t i = 0; i < ProxyWidth; ++i)
-    {
-        marginal_sum += conditional_sums[i];
-        marginal_distribution[i] = marginal_sum;
-    }
-
-    const float invMarginalSum = marginal_distribution[ProxyWidth - 1] <= 0.0f ? 0.0f : 1.0f / marginal_distribution[ProxyWidth - 1];
-
-    if(invMarginalSum != 0.0f)
-    {
-        for (size_t i = 0; i < ProxyWidth; ++i)
-        {
-            marginal_distribution[i] *= invMarginalSum;
-        }
-
-        marginal_distribution[ProxyWidth - 1] = 1.0f;
-
-        Vec8f distribution_row_left, distribution_row_right;
-        const auto div_mask_left = distribution_sum_left > Vec8f(0.0f);
-        const auto div_mask_right = distribution_sum_right > Vec8f(0.0f);
-
-        for (size_t y = 0; y < ProxyWidth - 1; ++y)
-        {
-            const Vec8i pixel_y(y);
-
-            for (size_t x = 0; x < ProxyWidth; x += 8)
-            {
-                const size_t index = y * ProxyWidth + x;
-
-                if (x == 0)
-                {
-                    distribution_row_left.load_a(&distribution[index]);
-                    distribution_row_left = if_div(div_mask_left, distribution_row_left, distribution_sum_left);
-                    distribution_row_left.store_a(&distribution[index]);
-                }
-                else
-                {
-                    distribution_row_right.load_a(&distribution[index]);
-                    distribution_row_right = if_div(div_mask_right, distribution_row_right, distribution_sum_right);
-                    distribution_row_right.store_a(&distribution[index]);
-                }
-            }
-        }
-
-        Vec8f(1.0f).store_a(&distribution[(ProxyWidth - 1) * ProxyWidth]);
-
-        if (ProxyWidth > 8)
-            Vec8f(1.0f).store_a(&distribution[(ProxyWidth - 1) * ProxyWidth + 8]);
-
-        // Set discrete pdf
-        for (size_t y = 0; y < ProxyWidth; ++y)
-        {
-            const Vec8i pixel_y(y);
-
-            for (size_t x = 0; x < ProxyWidth; x += 8)
-            {
-                const size_t index = y * ProxyWidth + x;
-
-                const Vec8f invTotal(invMarginalSum);
-                Vec8f radiance;
-                radiance.load_a(&m_map[index]);
-                (radiance * invTotal).store_a(&discrete_pdf[index]);
-            }
-        }
-    }
-    else
-    {
-        m_image_importance_sampler.set_to_zero();
-    }
-
-    // Build discrete 2D distribution
-    // m_image_importance_sampler.build(m_map);
+    m_image_importance_sampler.build();
 }
 
 void RadianceProxy::clear()
@@ -1217,7 +1142,19 @@ float RadianceProxy::sample(
     Point2f s = sampler->next2D();
     Point2u pixel;
 
-    float pdf = m_image_importance_sampler.sample(s, pixel);
+    float pdf;
+    m_image_importance_sampler.sample(s, pixel);
+
+    if (!m_image_importance_sampler.is_zero())
+    {
+        const size_t map_index = pixel.y * ProxyWidth + pixel.x;
+        pdf = m_map[map_index] / m_image_importance_sampler.get_total_radiance();
+    }
+    else
+    {
+        pdf = 1.0f / (ProxyWidth * ProxyWidth);
+    }
+
     assert(pdf >= 0.0f);
 
     Point2f cylindrical_direction(pixel.x, pixel.y);
@@ -1269,7 +1206,18 @@ float RadianceProxy::pdf(
     // TODO: More precise mapping between directions and map pixels to avoid discrepancies in sampled
     // and evaluated pdf values. There also seems to be another source causing these discrepancies.
 
-    float pdf = m_image_importance_sampler.pdf(pixel);
+    float pdf;
+
+    if (!m_image_importance_sampler.is_zero())
+    {
+        const size_t map_index = pixel.y * ProxyWidth + pixel.x;
+        pdf = m_map[map_index] / m_image_importance_sampler.get_total_radiance();
+    }
+    else
+    {
+        pdf = 1.0f / (ProxyWidth * ProxyWidth);
+    }
+
 
     assert(m_quadtree_strata != nullptr);
     assert(m_quadtree_strata->size() == ProxyWidth * ProxyWidth);

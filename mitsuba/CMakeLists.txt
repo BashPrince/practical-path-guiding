@@ -36,7 +36,9 @@ if(MSVC AND CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -mavx2")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mavx2")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -fno-trapping-math -fno-math-errno -fno-signed-zeros -mfma")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -fno-trapping-math -fno-math-errno -fno-signed-zeros -mfma")
 
 # make config 'RelWithDebInfo' debuggable by disabling optimizations
 if(MSVC)
