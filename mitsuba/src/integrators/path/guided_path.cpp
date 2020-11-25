@@ -438,6 +438,8 @@ public:
 
     bool is_built() const;
 
+    void set_maps(const RadianceProxy& other);
+
     static const size_t ProxyWidth = PROXYWIDTH;
 
     template <size_t Width>
@@ -541,6 +543,7 @@ public:
     ImageImportanceSampler<PROXYWIDTH> m_image_importance_sampler;
 
     std::array<float, PROXYWIDTH * PROXYWIDTH> m_map;
+    const std::array<float, PROXYWIDTH * PROXYWIDTH>* m_parent_map;
 
     std::shared_ptr<
         std::array<const QuadTreeNode *, PROXYWIDTH * PROXYWIDTH>>
@@ -974,7 +977,7 @@ void RadianceProxy::build_product_scalar(
             const Vector3f incoming = canonicalToDir(cylindrical_direction);
 #endif
 
-            const float product = m_map[index] * bsdf_proxy.evaluate(incoming);
+            const float product = (*m_parent_map)[index] * bsdf_proxy.evaluate(incoming);
             m_map[index] = product;
             distribution_sum += product;
             distribution[index] = distribution_sum;
@@ -1044,12 +1047,14 @@ void RadianceProxy::build_product_simd(
 
             const size_t index = y * ProxyWidth + x;
 
-            Vec8f incoming_x, incoming_y, incoming_z;
 
 #ifdef LOAD_INCOMING_ARRAY
-            incoming_x.load_a(worldDir_soa + (index * 3));
-            incoming_y.load_a(worldDir_soa + (index * 3 + 8));
-            incoming_z.load_a(worldDir_soa + (index * 3 + 2 * 8));
+            const Vec8f &incoming_x = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3));
+            const Vec8f &incoming_y = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3 + 8));
+            const Vec8f &incoming_z = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3 + 2 * 8));
+            // incoming_x.load_a(worldDir_soa + (index * 3));
+            // incoming_y.load_a(worldDir_soa + (index * 3 + 8));
+            // incoming_z.load_a(worldDir_soa + (index * 3 + 2 * 8));
 #else
             const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
             const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
@@ -1061,7 +1066,7 @@ void RadianceProxy::build_product_simd(
 
             const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z, Zero_SIMD, Zero_SIMD);
             Vec8f radiance;
-            radiance.load(&m_map[index]);
+            radiance.load(&((*m_parent_map)[index]));
             radiance *= bsdf_proxy_value;
             radiance.store(&m_map[index]);
 
@@ -1239,6 +1244,14 @@ float RadianceProxy::pdf(
 bool RadianceProxy::is_built() const
 {
     return m_is_built;
+}
+
+void RadianceProxy::set_maps(const RadianceProxy &other)
+{
+    m_parent_map = &other.m_map;
+    m_quadtree_strata = other.m_quadtree_strata;
+    m_quadtree_nodes = other.m_quadtree_nodes;
+    m_is_built = other.m_is_built;
 }
 
 class DTree {
@@ -3001,7 +3014,7 @@ public:
                 EGuidingMode guidingMode;
                 RadianceProxy radianceProxy;
                 if (dTree)
-                    radianceProxy = dTree->getRadianceProxy();
+                    radianceProxy.set_maps(dTree->getRadianceProxy());
 
                 setGuidingMode(bsdf, bRec, radianceProxy, dTree, bsdfSamplingFraction, productSamplingFraction, guidingMode);
 
