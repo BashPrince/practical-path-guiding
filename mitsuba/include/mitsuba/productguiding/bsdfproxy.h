@@ -160,8 +160,8 @@ class BSDFProxy
             const Vec8f &incoming_x, const Vec8f &incoming_y, const Vec8f &incoming_z, const Vec8f& diffuse_cosines, const Vec8f& reflection_cosines) const
     {
         Vec8f value(Zero_SIMD);
-        // const Vec8f cos_ni = min(dot_simd(normal_x, normal_y, normal_z, incoming_x, incoming_y, incoming_z) + diffuse_cosines, Vec8f(1.0f));
-        const Vec8f cos_ni = dot_simd(m_normal_x, m_normal_y, m_normal_z, incoming_x, incoming_y, incoming_z);
+        const Vec8f cos_ni = min(dot_simd(m_normal_x, m_normal_y, m_normal_z, incoming_x, incoming_y, incoming_z) + diffuse_cosines, One_SIMD);
+        // const Vec8f cos_ni = dot_simd(m_normal_x, m_normal_y, m_normal_z, incoming_x, incoming_y, incoming_z);
         const Vec8f cos_negni = -cos_ni;
 
         if (m_is_diffuse)
@@ -175,8 +175,8 @@ class BSDFProxy
         auto mask = cos_ni > Zero_SIMD;
         if (m_is_reflective && !horizontal_and(~mask))
         {
-            // const Vec8f cos_refl_i = min(dot_simd(reflection_lobe_x, reflection_lobe_y, reflection_lobe_z, incoming_x, incoming_y, incoming_z) + reflection_cosines, Vec8f(1.0f));
-            const Vec8f cos_refl_i = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, incoming_x, incoming_y, incoming_z);
+            const Vec8f cos_refl_i = min(dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, incoming_x, incoming_y, incoming_z) + reflection_cosines, One_SIMD);
+            // const Vec8f cos_refl_i = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, incoming_x, incoming_y, incoming_z);
 
             mask = mask & (cos_refl_i > Zero_SIMD);
             if (!horizontal_and(~mask))
