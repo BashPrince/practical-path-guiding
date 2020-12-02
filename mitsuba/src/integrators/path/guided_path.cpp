@@ -1061,8 +1061,8 @@ void RadianceProxy::build_product_scalar(
                 BSDFProxy bsdf_proxy;
 
                 const Point2f cylindrical_direction_lobe(
-                    dest_x * inv_full_width,
-                    dest_y * inv_full_width);
+                    (dest_x + 0.5f) * inv_full_width,
+                    (dest_y + 0.5f) * inv_full_width);
 
                 const Vector3f lobe = canonicalToDir(cylindrical_direction_lobe);
 
