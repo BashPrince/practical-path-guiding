@@ -36,9 +36,12 @@
 #include <mitsuba/productguiding/vcl-v2/vectorclass.h>
 #include <mitsuba/productguiding/vcl-v2/vectormath_trig.h>
 
+#include <mitsuba/productguiding/cosines_8x8_8x8.h>
+// #include <mitsuba/productguiding/cosines_16x16.h>
+
 #include <mutex>
 
-#define BUILD_SIMD_PRODUCT
+// #define BUILD_SIMD_PRODUCT
 #define PROXYWIDTH 16
 #define LOAD_INCOMING_ARRAY
 
@@ -114,14 +117,14 @@ inline Point2 dirToCanonical(const Vector &d)
     return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
 }
 
-inline void canonicalToDir_simd(const Vec8f &p_x, const Vec8f &p_y, Vec8f &outDir_x, Vec8f &outDir_y, Vec8f &outDir_z)
+inline void canonicalToDir_simd(const Vec4f &p_x, const Vec4f &p_y, Vec4f &outDir_x, Vec4f &outDir_y, Vec4f &outDir_z)
 {
-    const Vec8f cosTheta = Two_SIMD * p_x - One_SIMD;
-    const Vec8f phi = Two_SIMD * Vec8f(M_PI) * p_y;
+    const Vec4f cosTheta = Two_SIMD * p_x - One_SIMD;
+    const Vec4f phi = Two_SIMD * Vec4f(M_PI) * p_y;
 
-    const Vec8f sinTheta = sqrt(One_SIMD - cosTheta * cosTheta);
-    Vec8f cosPhi;
-    const Vec8f sinPhi = sincos(&cosPhi, phi);
+    const Vec4f sinTheta = sqrt(One_SIMD - cosTheta * cosTheta);
+    Vec4f cosPhi;
+    const Vec4f sinPhi = sincos(&cosPhi, phi);
 
     outDir_x = sinTheta * cosPhi;
     outDir_y = sinTheta * sinPhi;
@@ -230,7 +233,7 @@ void make_incoming_arrays(const size_t ProxyWidth)
     file_scalar.close();
 }
 
-alignas(32) float cosines[256 * 256];
+// alignas(32) float cosines[256 * 256];
 bool cosines_loaded = false;
 std::mutex cosine_mutex;
 
@@ -932,6 +935,54 @@ float cos_theta_to_boundary(const Point2u &p, const Point2u &dest, const float P
     return dot(destination, normalize(current)) - dot(destination, incoming);
 }
 
+// Return cos theta between lobe and incoming with boundary shift
+float cos_theta_lobe_in(const Point2u &p, const Point2u &dest, const size_t ProxyWidth, const size_t PixelWidth)
+{
+    if (p == dest / PixelWidth)
+        return 1.0f;
+
+    const float inv_width = 1.0f / ProxyWidth;
+    const float inv_subpixel_width = 1.0f / (ProxyWidth * PixelWidth);
+    const Point2f cylindrical_direction_p(
+        (p.x + 0.5f) * inv_width,
+        (p.y + 0.5f) * inv_width);
+
+    const Point2f cylindrical_direction_dest(
+        (dest.x + 0.5f) * inv_subpixel_width,
+        (dest.y + 0.5f) * inv_subpixel_width);
+
+    const Vector3f incoming = canonicalToDir(cylindrical_direction_p);
+    const Vector3f destination = canonicalToDir(cylindrical_direction_dest);
+
+    // For opposite sides return 0
+    if ((incoming + destination).length() < 0.001)
+        return 0.0f;
+
+    const Vector3f diff = destination - incoming;
+
+    Vector3f current = incoming;
+    Point2u currentPixel = p;
+    Vector3f step = diff * 0.01f;
+
+    while (currentPixel == p)
+    {
+        // Step along line towards dest
+        current += step;
+
+        // Reproject onto sphere
+        const Vector3f s = normalize(current);
+        const Point2f s_canonical = dirToCanonical(s) * static_cast<float>(ProxyWidth);
+
+        // Pixel coords
+        currentPixel = Point2u(s_canonical.x, s_canonical.y);
+
+        currentPixel.x = std::min(currentPixel.x, static_cast<unsigned int>(ProxyWidth - 1));
+        currentPixel.y = std::min(currentPixel.y, static_cast<unsigned int>(ProxyWidth - 1));
+    }
+
+    return dot(destination, normalize(current));
+}
+
 void RadianceProxy::build_product(
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
@@ -960,6 +1011,7 @@ void RadianceProxy::build_product_scalar(
     float *distribution = m_image_importance_sampler.get_distribution();
 
     const float inv_width = 1.0f / ProxyWidth;
+
     for (size_t y = 0; y < ProxyWidth; ++y)
     {
         float distribution_sum = 0.0f;
@@ -985,6 +1037,81 @@ void RadianceProxy::build_product_scalar(
     }
     // Build discrete 2D distribution
     m_image_importance_sampler.build();
+
+
+
+    const size_t PixelOutWidth = 4;
+    const size_t alpha_steps = 49;
+    const size_t array_size = alpha_steps * ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth;
+    float *diffuse_proxies = new float[array_size];
+    float *reflectance_proxies = new float[array_size];
+
+    const float inv_full_width = 1.0f / (ProxyWidth * PixelOutWidth);
+    for (size_t a = 0; a < alpha_steps; ++a)
+    {
+        const float alpha = 0.01f + a * 0.02f;
+
+        for (size_t dest_y = 0; dest_y < ProxyWidth * PixelOutWidth; ++dest_y)
+        {
+            for (size_t dest_x = 0; dest_x < ProxyWidth * PixelOutWidth; ++dest_x)
+            {
+                const Point2u dest_pixel(dest_x, dest_y);
+
+                // Create a proxy with outgoing dir = dest_pixel and alpha
+                BSDFProxy bsdf_proxy;
+
+                const Point2f cylindrical_direction_lobe(
+                    dest_x * inv_full_width,
+                    dest_y * inv_full_width);
+
+                const Vector3f lobe = canonicalToDir(cylindrical_direction_lobe);
+
+                for (size_t y = 0; y < ProxyWidth; ++y)
+                {
+                    for (size_t x = 0; x < ProxyWidth; ++x)
+                    {
+                        const Point2u incoming_pixel(x, y);
+
+                        // Proxy integral
+                        float proxy_diffuse_integral = 0.0f;
+                        float proxy_reflectance_integral = 0.0f;
+
+                        for (size_t proxy_x = 0; proxy_x < 10; ++proxy_x)
+                        {
+                            for (size_t proxy_y = 0; proxy_y < 10; ++proxy_y)
+                            {
+                                const Point2f cylindrical_direction_incoming(
+                                    (x + (proxy_x + 0.5f) * 0.1f) * inv_width,
+                                    (y + (proxy_y + 0.5f) * 0.1f) * inv_width);
+
+                                const Vector3f incoming = canonicalToDir(cylindrical_direction_incoming);
+                                proxy_diffuse_integral += bsdf_proxy.evaluate_diffuse(incoming, lobe);
+                                proxy_reflectance_integral += bsdf_proxy.evaluate_reflectance(incoming, lobe, alpha);
+                            }
+                        }
+
+                        proxy_diffuse_integral *= 0.01f;
+                        proxy_reflectance_integral *= 0.01f;
+
+                        const size_t index = a * (ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth) +
+                                             (dest_y * ProxyWidth * PixelOutWidth + dest_x) * (ProxyWidth * ProxyWidth) + y * ProxyWidth + x;
+
+                        diffuse_proxies[index] = proxy_diffuse_integral;
+                        reflectance_proxies[index] = proxy_reflectance_integral;
+                    }
+                }
+            }
+        }
+    }
+
+    std::ofstream file("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table.bin", std::ios::out | std::ios::binary);
+
+    file.write((const char*)diffuse_proxies, array_size * sizeof(float));
+    file.write((const char*)reflectance_proxies, array_size * sizeof(float));
+
+    file.close();
+    delete[] diffuse_proxies;
+    delete[] reflectance_proxies;
 }
 
 void RadianceProxy::build_product_simd(
@@ -1000,78 +1127,90 @@ void RadianceProxy::build_product_simd(
     bsdf_proxy.finish_parameterization(outgoing, shading_normal);
     m_product_is_built = true;
 
-    const Vec8f inv_width(1.0f / ProxyWidth);
-    const Vec8i simd_loop_offsets(0, 1, 2, 3, 4, 5, 6, 7);
+    const Vec4f inv_width(1.0f / ProxyWidth);
+    const Vec4i simd_loop_offsets(0, 1, 2, 3);
 
     float* distribution = m_image_importance_sampler.get_distribution();
 
-    Vec8f distribution_sum_left(Zero_SIMD);
-    Vec8f distribution_sum_right(Zero_SIMD);
+    Vec4f distribution_sum_left(Zero_SIMD);
+    Vec4f distribution_sum_right(Zero_SIMD);
 
-    if (!cosines_loaded)
-    {
-        std::lock_guard<std::mutex> guard(cosine_mutex);
+    // if (!cosines_loaded)
+    // {
+    //     std::lock_guard<std::mutex> guard(cosine_mutex);
 
-        if(!cosines_loaded)
-        {
-            char* data = reinterpret_cast<char*>(cosines);
-            std::ifstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::in | std::ios::binary);
-            file.read(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
-            file.close();
+    //     if(!cosines_loaded)
+    //     {
+    //         char* data = reinterpret_cast<char*>(cosines);
+    //         std::ifstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::in | std::ios::binary);
+    //         file.read(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
+    //         file.close();
 
-            cosines_loaded = true;
-        }
-    }
+    //         cosines_loaded = true;
+    //     }
+    // }
 
     Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
     bsdf_proxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
 
-    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(ProxyWidth);
-    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(ProxyWidth);
+    const size_t PixelWidth = 8;
+    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(ProxyWidth * PixelWidth);
+    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(ProxyWidth * PixelWidth);
 
     Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
     Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
 
-    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), ProxyWidth - 1);
-    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), ProxyWidth - 1);
-    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), ProxyWidth - 1);
-    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), ProxyWidth - 1);
+    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), ProxyWidth * PixelWidth - 1);
+    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), ProxyWidth * PixelWidth - 1);
+    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), ProxyWidth * PixelWidth - 1);
+    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), ProxyWidth * PixelWidth - 1);
 
-    const float* diffuse_cosines_array = &cosines[(diffuse_pixel.y * ProxyWidth + diffuse_pixel.x) * ProxyWidth * ProxyWidth];
-    const float* reflectance_cosines_array = &cosines[(reflectance_pixel.y * ProxyWidth + reflectance_pixel.x) * ProxyWidth * ProxyWidth];
+    const float* diffuse_cosines_array = &cosines[(diffuse_pixel.y * ProxyWidth * PixelWidth + diffuse_pixel.x) * ProxyWidth * ProxyWidth];
+    const float* reflectance_cosines_array = &cosines[(reflectance_pixel.y * ProxyWidth * PixelWidth + reflectance_pixel.x) * ProxyWidth * ProxyWidth];
 
     for (size_t y = 0; y < ProxyWidth; ++y)
     {
-        const Vec8i pixel_y(y);
+        const Vec4i pixel_y(y);
 
-        for (size_t x = 0; x < ProxyWidth; x += 8)
+        for (size_t x = 0; x < ProxyWidth; x += 4)
         {
-            const Vec8i pixel_x = Vec8i(x) + simd_loop_offsets;
+            const Vec4i pixel_x = Vec4i(x) + simd_loop_offsets;
 
             const size_t index = y * ProxyWidth + x;
 
 
 #ifdef LOAD_INCOMING_ARRAY
-            const Vec8f &incoming_x = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3));
-            const Vec8f &incoming_y = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3 + 8));
-            const Vec8f &incoming_z = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3 + 2 * 8));
+            const Vec4f incoming_x;// = *reinterpret_cast<const Vec4f*>(worldDir_soa + (index * 3));
+            const Vec4f incoming_y;// = *reinterpret_cast<const Vec4f*>(worldDir_soa + (index * 3 + 8));
+            const Vec4f incoming_z;// = *reinterpret_cast<const Vec4f*>(worldDir_soa + (index * 3 + 2 * 8));
             // incoming_x.load_a(worldDir_soa + (index * 3));
             // incoming_y.load_a(worldDir_soa + (index * 3 + 8));
             // incoming_z.load_a(worldDir_soa + (index * 3 + 2 * 8));
 #else
-            const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
-            const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
+            const Vec4f cylindrical_direction_x = (to_float(pixel_x) + Vec4f(0.5f)) * inv_width;
+            const Vec4f cylindrical_direction_y = (to_float(pixel_y) + Vec4f(0.5f)) * inv_width;
             canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
 #endif
-            Vec8f diffuse_cosines, reflectance_cosines;
+            Vec4f diffuse_cosines, reflectance_cosines;
             diffuse_cosines.load_a(&diffuse_cosines_array[index]);
             reflectance_cosines.load_a(&reflectance_cosines_array[index]);
 
-            const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z, diffuse_cosines, reflectance_cosines);
-            Vec8f radiance;
-            radiance.load(&((*m_parent_map)[index]));
-            radiance *= bsdf_proxy_value;
+            auto mask = diffuse_cosines > Zero_SIMD;
+
+            Vec4f radiance;
+            if (!horizontal_and(~mask))
+            {
+                const Vec4f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z, diffuse_cosines, reflectance_cosines);
+                radiance.load(&((*m_parent_map)[index]));
+                radiance *= bsdf_proxy_value;
+            }
+            else
+            {
+                radiance = diffuse_cosines;
+            }
+
             radiance.store(&m_map[index]);
+
 
             if (x == 0)
             {
@@ -1085,39 +1224,6 @@ void RadianceProxy::build_product_simd(
             }
         }
     }
-
-    // float cosines[ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth];
-
-    // for (size_t dest_y = 0; dest_y < ProxyWidth; ++dest_y)
-    // {
-    //     for (size_t dest_x = 0; dest_x < ProxyWidth; ++dest_x)
-    //     {
-    //         const Point2u dest_pixel(dest_x, dest_y);
-    //         size_t dest_index = dest_y * ProxyWidth + dest_x;
-
-    //         for (size_t y = 0; y < ProxyWidth; ++y)
-    //         {
-    //             for (size_t x = 0; x < ProxyWidth; ++x)
-    //             {
-    //                 const Point2u incoming_pixel(x, y);
-    //                 size_t index = y * ProxyWidth + x;
-
-    //                 const float cos_theta = cos_theta_to_boundary(incoming_pixel, dest_pixel, ProxyWidth);
-    //                 cosines[dest_index * ProxyWidth * ProxyWidth + index] = cos_theta;
-
-    //                 if (cos_theta > M_PI / 4.0f && cos_theta != 1.0f)
-    //                 {
-    //                     const float cos_theta_2 = cos_theta_to_boundary(incoming_pixel, dest_pixel, ProxyWidth);
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
-
-    // const char* data = reinterpret_cast<const char*>(cosines);
-    // std::ofstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::out | std::ios::binary);
-    // file.write(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
-    // file.close();
 
     m_image_importance_sampler.build();
 }
