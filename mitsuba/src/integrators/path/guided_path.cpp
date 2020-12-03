@@ -1001,9 +1001,9 @@ int mip_order_index_to_linear_index(const int index, const size_t mip_width)
 
     int x = index;
 
-    for (size_t i = 0; i < 16; ++i)
+    for (size_t i = 0; i < 10; ++i)
     {
-        if (x % 1 == 1)
+        if (x % 2 == 1)
             p.x += 1 << i;
         
         x = x >> 2;
@@ -1011,9 +1011,9 @@ int mip_order_index_to_linear_index(const int index, const size_t mip_width)
 
     int y = index >> 1;
 
-    for (size_t i = 0; i < 16; ++i)
+    for (size_t i = 0; i < 10; ++i)
     {
-        if (y % 1 == 1)
+        if (y % 2 == 1)
             p.y += 1 << i;
         
         y = y >> 2;
