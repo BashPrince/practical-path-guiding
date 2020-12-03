@@ -1164,7 +1164,7 @@ void RadianceProxy::build_product_scalar(
                     auto& prev_mip_map_diffuse = *(diffuse_mips.begin()++);
                     auto& prev_mip_map_reflect = *(reflect_mips.begin()++);
 
-                    for (size_t i = 0; i < mip_width; ++i)
+                    for (size_t i = 0; i < mip_width * mip_width; ++i)
                     {
                         float average_diffuse = 0.0f;
                         float average_reflect = 0.0f;
