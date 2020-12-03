@@ -995,6 +995,33 @@ void RadianceProxy::build_product(
 #endif
 }
 
+int mip_order_index_to_linear_index(const int index, const size_t mip_width)
+{
+    Point2u p(0, 0);
+
+    int x = index;
+
+    for (size_t i = 0; i < 16; ++i)
+    {
+        if (x % 1 == 1)
+            p.x += 1 << i;
+        
+        x = x >> 2;
+    }
+
+    int y = index >> 1;
+
+    for (size_t i = 0; i < 16; ++i)
+    {
+        if (y % 1 == 1)
+            p.y += 1 << i;
+        
+        y = y >> 2;
+    }
+
+    return p.y * mip_width + p.x;
+}
+
 void RadianceProxy::build_product_scalar(
     BSDFProxy& bsdf_proxy,
     const Vector3f& outgoing,
@@ -1040,11 +1067,20 @@ void RadianceProxy::build_product_scalar(
 
 
 
-    const size_t PixelOutWidth = 4;
+    const size_t PixelOutWidth = 2;
     const size_t alpha_steps = 49;
-    const size_t array_size = alpha_steps * ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth;
-    float *diffuse_proxies = new float[array_size];
-    float *reflectance_proxies = new float[array_size];
+
+    size_t p = ProxyWidth;
+    size_t total_mip_entries = 0;
+
+    while (p > 1)
+    {
+        total_mip_entries += p * p;
+        p /= 2;
+    }
+
+    const size_t array_size = alpha_steps * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth * total_mip_entries * 2;
+    float *mips = new float[array_size];
 
     const float inv_full_width = 1.0f / (ProxyWidth * PixelOutWidth);
     for (size_t a = 0; a < alpha_steps; ++a)
@@ -1065,6 +1101,9 @@ void RadianceProxy::build_product_scalar(
                     (dest_y + 0.5f) * inv_full_width);
 
                 const Vector3f lobe = canonicalToDir(cylindrical_direction_lobe);
+
+                float proxy_map_diffuse[ProxyWidth * ProxyWidth];
+                float proxy_map_reflect[ProxyWidth * ProxyWidth];
 
                 for (size_t y = 0; y < ProxyWidth; ++y)
                 {
@@ -1093,25 +1132,88 @@ void RadianceProxy::build_product_scalar(
                         proxy_diffuse_integral *= 0.01f;
                         proxy_reflectance_integral *= 0.01f;
 
-                        const size_t index = a * (ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth) +
-                                             (dest_y * ProxyWidth * PixelOutWidth + dest_x) * (ProxyWidth * ProxyWidth) + y * ProxyWidth + x;
-
-                        diffuse_proxies[index] = proxy_diffuse_integral;
-                        reflectance_proxies[index] = proxy_reflectance_integral;
+                        proxy_map_diffuse[y * ProxyWidth + x] = proxy_diffuse_integral;
+                        proxy_map_reflect[y * ProxyWidth + x] = proxy_reflectance_integral;
                     }
+                }
+
+                // Generate Mip Maps
+                std::list<std::vector<float>> diffuse_mips;
+                std::list<std::vector<float>> reflect_mips;
+                diffuse_mips.push_back(std::vector<float>(ProxyWidth * ProxyWidth));
+                reflect_mips.push_back(std::vector<float>(ProxyWidth * ProxyWidth));
+
+                for (int i = 0; i < ProxyWidth * ProxyWidth; ++i)
+                {
+                    auto &mip_map_diffuse = diffuse_mips.front();
+                    auto &mip_map_reflect = reflect_mips.front();
+
+                    mip_map_diffuse[i] = proxy_map_diffuse[mip_order_index_to_linear_index(i, ProxyWidth)];
+                    mip_map_reflect[i] = proxy_map_reflect[mip_order_index_to_linear_index(i, ProxyWidth)];
+                }
+
+                size_t mip_width = ProxyWidth / 2;
+
+                while (mip_width > 1)
+                {
+                    diffuse_mips.push_front(std::vector<float>(mip_width * mip_width));
+                    reflect_mips.push_front(std::vector<float>(mip_width * mip_width));
+
+                    auto& mip_map_diffuse = diffuse_mips.front();
+                    auto& mip_map_reflect = reflect_mips.front();
+                    auto& prev_mip_map_diffuse = *(diffuse_mips.begin()++);
+                    auto& prev_mip_map_reflect = *(reflect_mips.begin()++);
+
+                    for (size_t i = 0; i < mip_width; ++i)
+                    {
+                        float average_diffuse = 0.0f;
+                        float average_reflect = 0.0f;
+
+                        for (size_t j = 0; j < 4; ++j)
+                        {
+                            average_diffuse += prev_mip_map_diffuse[i * 4 + j];
+                            average_reflect += prev_mip_map_reflect[i * 4 + j];
+                        }
+
+                        mip_map_diffuse[i] = average_diffuse * 0.25f;
+                        mip_map_reflect[i] = average_reflect * 0.25f;
+                    }
+
+                    mip_width /= 2;
+                }
+
+                size_t index = a * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth * total_mip_entries * 2 +
+                                        (dest_y * ProxyWidth * PixelOutWidth + dest_x) * total_mip_entries * 2;
+                
+                auto diffuse_itr = diffuse_mips.begin();
+                auto reflect_itr = reflect_mips.begin();
+
+                while (diffuse_itr != diffuse_mips.end())
+                {
+                    auto& diffuse_mip = *diffuse_itr;
+                    auto& reflect_mip = *reflect_itr;
+
+                    for (size_t i = 0; i < diffuse_mip.size(); ++i)
+                    {
+                        mips[index + 2 * i] = diffuse_mip[i];
+                        mips[index + 2 * i + 1] = reflect_mip[i];
+                    }
+
+                    diffuse_itr++;
+                    reflect_itr++;
+                    index += 2 * diffuse_mip.size();
                 }
             }
         }
     }
+    
 
-    std::ofstream file("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table.bin", std::ios::out | std::ios::binary);
+    std::ofstream file("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_mips.bin", std::ios::out | std::ios::binary);
 
-    file.write((const char*)diffuse_proxies, array_size * sizeof(float));
-    file.write((const char*)reflectance_proxies, array_size * sizeof(float));
+    file.write((const char*)mips, array_size * sizeof(float));
 
     file.close();
-    delete[] diffuse_proxies;
-    delete[] reflectance_proxies;
+    delete[] mips;
 }
 
 void RadianceProxy::build_product_simd(
