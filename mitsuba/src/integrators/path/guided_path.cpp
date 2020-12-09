@@ -39,8 +39,8 @@
 #include <mutex>
 
 #define BUILD_SIMD_PRODUCT
-#define PROXYWIDTH 16
-#define LOAD_INCOMING_ARRAY
+#define PROXYWIDTH 4
+// #define LOAD_INCOMING_ARRAY
 
 #ifdef LOAD_INCOMING_ARRAY
 #if PROXYWIDTH == 16
@@ -51,6 +51,9 @@
     #error(ProxyWidth neither 8 nor 16)
 #endif
 #endif
+
+const size_t PixelOutWidth = 16;
+const size_t alpha_steps = 25;
 
 MTS_NAMESPACE_BEGIN
 
@@ -87,41 +90,14 @@ inline Float logistic(Float x) {
     return 1 / (1 + std::exp(-x));
 }
 
-inline Vector canonicalToDir(Point2 p)
+inline void canonicalToDir_simd(const Vec4f &p_x, const Vec4f &p_y, Vec4f &outDir_x, Vec4f &outDir_y, Vec4f &outDir_z)
 {
-    const Float cosTheta = 2 * p.x - 1;
-    const Float phi = 2 * M_PI * p.y;
+    const Vec4f cosTheta = Two_SIMD * p_x - One_SIMD;
+    const Vec4f phi = Two_SIMD * Vec4f(M_PI) * p_y;
 
-    const Float sinTheta = sqrt(1 - cosTheta * cosTheta);
-    Float sinPhi, cosPhi;
-    math::sincos(phi, &sinPhi, &cosPhi);
-
-    return {sinTheta * cosPhi, sinTheta * sinPhi, cosTheta};
-}
-
-inline Point2 dirToCanonical(const Vector &d)
-{
-    if (!std::isfinite(d.x) || !std::isfinite(d.y) || !std::isfinite(d.z))
-    {
-        return {0, 0};
-    }
-
-    const Float cosTheta = std::min(std::max(d.z, -1.0f), 1.0f);
-    Float phi = std::atan2(d.y, d.x);
-    while (phi < 0)
-        phi += 2.0 * M_PI;
-
-    return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
-}
-
-inline void canonicalToDir_simd(const Vec8f &p_x, const Vec8f &p_y, Vec8f &outDir_x, Vec8f &outDir_y, Vec8f &outDir_z)
-{
-    const Vec8f cosTheta = Two_SIMD * p_x - One_SIMD;
-    const Vec8f phi = Two_SIMD * Vec8f(M_PI) * p_y;
-
-    const Vec8f sinTheta = sqrt(One_SIMD - cosTheta * cosTheta);
-    Vec8f cosPhi;
-    const Vec8f sinPhi = sincos(&cosPhi, phi);
+    const Vec4f sinTheta = sqrt(One_SIMD - cosTheta * cosTheta);
+    Vec4f cosPhi;
+    const Vec4f sinPhi = sincos(&cosPhi, phi);
 
     outDir_x = sinTheta * cosPhi;
     outDir_y = sinTheta * sinPhi;
@@ -412,7 +388,9 @@ public:
     void build_product(
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
-        const Vector3f &shading_normal);
+        const Vector3f &shading_normal,
+        const float* diffuse_integrals,
+        const float* reflectance_integrals);
 
     void build_product_scalar(
         BSDFProxy &bsdf_proxy,
@@ -422,7 +400,9 @@ public:
     void build_product_simd(
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
-        const Vector3f &shading_normal);
+        const Vector3f &shading_normal,
+        const float* diffuse_integrals,
+        const float* reflectance_integrals);
     
     void clear();
 
@@ -431,10 +411,12 @@ public:
 
     float sample(
         Sampler *sampler,
-        Vector3f &direction) const;
+        Vector3f &direction,
+        const BSDFProxy& bsdfProxy) const;
 
     float pdf(
-        const Vector3f &direction) const;
+        const Vector3f &direction,
+        const BSDFProxy &bsdfProxy) const;
 
     bool is_built() const;
 
@@ -643,6 +625,84 @@ public:
         }
     }
 
+    Float pdf_product(Point2 &p, const std::vector<QuadTreeNode> &nodes, const BSDFProxy& bsdfProxy, const Point2f& origin, const Point2f& width) const
+    {
+        SAssert(p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1);
+        const int index = childIndex(p);
+        if (!(sum(index) > 0))
+        {
+            return 0;
+        }
+
+        bool use_integral = width.x + 0.0001 >= 1 / 32.0f;
+        Float factor;
+
+        Float bsdf_proxy[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+        if (use_integral)
+        {
+            bsdf_proxy[0] = bsdfProxy.approximate_integral(origin, width);
+            bsdf_proxy[1] = bsdfProxy.approximate_integral(origin + Point2f(width.x, 0.0f), width);
+            bsdf_proxy[2] = bsdfProxy.approximate_integral(origin + Point2f(0.0f, width.y), width);
+            bsdf_proxy[3] = bsdfProxy.approximate_integral(origin + Point2f(width.x, width.y), width);
+        }
+        else
+        {
+            const Point2f offset = width * 0.5f;
+
+            bsdf_proxy[0] = bsdfProxy.evaluate(canonicalToDir(origin + offset));
+            bsdf_proxy[1] = bsdfProxy.evaluate(canonicalToDir(origin + Point2f(width.x, 0.0f) + offset));
+            bsdf_proxy[2] = bsdfProxy.evaluate(canonicalToDir(origin + Point2f(0.0f, width.y) + offset));
+            bsdf_proxy[3] = bsdfProxy.evaluate(canonicalToDir(origin + Point2f(width.x, width.y) + offset));
+        }
+
+        Float total = sum(0) * bsdf_proxy[0] + sum(1) * bsdf_proxy[1] + sum(2) * bsdf_proxy[2] + sum(3) * bsdf_proxy[3];
+
+        if (!(total > 0.0f))
+        {
+            bsdf_proxy[0] = 1.0f;
+            bsdf_proxy[1] = 1.0f;
+            bsdf_proxy[2] = 1.0f;
+            bsdf_proxy[3] = 1.0f;
+
+            total = sum(0) + sum(1) + sum(2) + sum(3);
+
+            if (!(total > 0.0f))
+                return 1;
+        }
+
+        factor = 4 * sum(index) * bsdf_proxy[index] / total;
+
+        if (isLeaf(index))
+        {
+            return factor;
+        }
+        else
+        {
+            Point2f nextOrigin = origin;
+
+            if (index == 1)
+            {
+                nextOrigin += Point2f(width.x, 0.0f);
+            }
+            else if (index == 2)
+            {
+                nextOrigin += Point2f(0.0f, width.y);
+            }
+            else if (index == 3)
+            {
+                nextOrigin += Point2f(width.x, width.y);
+            }
+
+            return factor * nodes[child(index)].pdf_product(
+                                p,
+                                nodes,
+                                bsdfProxy,
+                                nextOrigin,
+                                width * 0.5f);
+        }
+    }
+
     int depthAt(Point2& p, const std::vector<QuadTreeNode>& nodes) const {
         SAssert(p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1);
         const int index = childIndex(p);
@@ -696,6 +756,117 @@ public:
             return origin + 0.5f * sampler->next2D();
         } else {
             return origin + 0.5f * nodes[child(index)].sample(sampler, nodes);
+        }
+    }
+
+    Point2 sample_product(Sampler* sampler, const std::vector<QuadTreeNode>& nodes, const BSDFProxy& bsdfProxy, const Point2f& proxy_origin, const Point2f& width) const {
+        int index = 0;
+
+        bool use_integral = width.x + 0.0001 >= 1 / 32.0f;
+
+        Float topLeft;
+        Float topRight;
+        Float partial;
+        Float total = 0.0f;
+
+        Float bsdf_proxy[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+        if (use_integral)
+        {
+            bsdf_proxy[0] = bsdfProxy.approximate_integral(proxy_origin, width);
+            bsdf_proxy[1] = bsdfProxy.approximate_integral(proxy_origin + Point2f(width.x, 0.0f), width);
+            bsdf_proxy[2] = bsdfProxy.approximate_integral(proxy_origin + Point2f(0.0f, width.y), width);
+            bsdf_proxy[3] = bsdfProxy.approximate_integral(proxy_origin + Point2f(width.x, width.y), width);
+        }
+        else
+        {
+            const Point2f offset = width * 0.5f;
+
+            bsdf_proxy[0] = bsdfProxy.evaluate(canonicalToDir(proxy_origin + offset));
+            bsdf_proxy[1] = bsdfProxy.evaluate(canonicalToDir(proxy_origin + Point2f(width.x, 0.0f) + offset));
+            bsdf_proxy[2] = bsdfProxy.evaluate(canonicalToDir(proxy_origin + Point2f(0.0f, width.y) + offset));
+            bsdf_proxy[3] = bsdfProxy.evaluate(canonicalToDir(proxy_origin + Point2f(width.x, width.y) + offset));
+        }
+
+        topLeft = sum(0) * bsdf_proxy[0];                    // + reflect_weight * (mip_map[offset] > 0.0f ? mip_map[offset + 1] : 0.0f));
+        topRight = sum(1) * bsdf_proxy[1];                   // + reflect_weight * (mip_map[offset + 2] > 0.0f ? mip_map[offset + 3] : 0.0f));
+        partial = topLeft + sum(2) * bsdf_proxy[2];          // + reflect_weight * (mip_map[offset + 4] > 0.0f ? mip_map[offset + 5] : 0.0f));
+        total = partial + topRight + sum(3) * bsdf_proxy[3]; // + reflect_weight * (mip_map[offset + 6] > 0.0f ? mip_map[offset + 7] : 0.0f));
+
+        // if (total <= 0.0f)
+        // {
+        //     topLeft = sum(0);
+        //     topRight = sum(1);
+        //     partial = topLeft + sum(2);
+        //     total = partial + topRight + sum(3);
+
+        //     use_product = false;
+        // }
+
+
+
+        // Should only happen when there are numerical instabilities.
+        if (!(total > 0.0f))
+        {
+            topLeft = sum(0);
+            topRight = sum(1);
+            partial = topLeft + sum(2);
+            total = partial + topRight + sum(3);
+            
+            if (!(total > 0.0f))
+                return sampler->next2D();
+        }
+
+        Float boundary = partial / total;
+        Point2 origin = Point2{0.0f, 0.0f};
+
+        Float sample = sampler->next1D();
+
+        if (sample < boundary) {
+            SAssert(partial > 0);
+            sample /= boundary;
+            boundary = topLeft / partial;
+        } else {
+            partial = total - partial;
+            SAssert(partial > 0);
+            origin.x = 0.5f;
+            sample = (sample - boundary) / (1.0f - boundary);
+            boundary = topRight / partial;
+            index |= 1 << 0;
+        }
+
+        if (sample < boundary) {
+            sample /= boundary;
+        } else {
+            origin.y = 0.5f;
+            sample = (sample - boundary) / (1.0f - boundary);
+            index |= 1 << 1;
+        }
+
+        if (isLeaf(index)) {
+            return origin + 0.5f * sampler->next2D();
+        } else {
+            Point2f nextOrigin = proxy_origin;
+
+            if (index == 1)
+            {
+                nextOrigin += Point2f(width.x, 0.0f);
+            }
+            else if (index == 2)
+            {
+                nextOrigin += Point2f(0.0f, width.y);
+            }
+            else if (index == 3)
+            {
+                nextOrigin += Point2f(width.x, width.y);
+            }
+
+            return origin + 0.5f * nodes[child(index)].sample_product(
+                                       sampler,
+                                       nodes,
+                                       bsdfProxy,
+                                       nextOrigin,
+                                       width * 0.5f);
         }
     }
 
@@ -935,10 +1106,12 @@ float cos_theta_to_boundary(const Point2u &p, const Point2u &dest, const float P
 void RadianceProxy::build_product(
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
-    const Vector3f &shading_normal)
+    const Vector3f &shading_normal,
+    const float* diffuse_integral,
+    const float* reflectance_integral)
 {
 #ifdef BUILD_SIMD_PRODUCT
-    build_product_simd(bsdf_proxy, outgoing, shading_normal);
+    build_product_simd(bsdf_proxy, outgoing, shading_normal, diffuse_integral, reflectance_integral);
 #else
     build_product_scalar(bsdf_proxy, outgoing, shading_normal);
 #endif
@@ -971,13 +1144,10 @@ void RadianceProxy::build_product_scalar(
 #ifdef LOAD_INCOMING_ARRAY
             const Vector3f incoming(worldDir_scalar[3 * index], worldDir_scalar[3 * index + 1], worldDir_scalar[3 * index + 2]);
 #else
-            const Point2f cylindrical_direction(
-                (x + 0.5f) * inv_width,
-                (y + 0.5f) * inv_width);
-            const Vector3f incoming = canonicalToDir(cylindrical_direction);
+        const Point2f origin = Point2f(x, y) * inv_width;
 #endif
 
-            const float product = (*m_parent_map)[index] * bsdf_proxy.evaluate(incoming);
+            const float product = (*m_parent_map)[index] * bsdf_proxy.approximate_integral(origin, Point2f(inv_width));
             m_map[index] = product;
             distribution_sum += product;
             distribution[index] = distribution_sum;
@@ -990,7 +1160,9 @@ void RadianceProxy::build_product_scalar(
 void RadianceProxy::build_product_simd(
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
-    const Vector3f &shading_normal)
+    const Vector3f &shading_normal,
+    const float* diffuse_table,
+    const float* reflectance_table)
 {
     assert(m_is_built);
 
@@ -1000,124 +1172,65 @@ void RadianceProxy::build_product_simd(
     bsdf_proxy.finish_parameterization(outgoing, shading_normal);
     m_product_is_built = true;
 
-    const Vec8f inv_width(1.0f / ProxyWidth);
-    const Vec8i simd_loop_offsets(0, 1, 2, 3, 4, 5, 6, 7);
+    const Vec4f inv_width(1.0f / ProxyWidth);
+    const Vec4i simd_loop_offsets(0, 1, 2, 3);
 
     float* distribution = m_image_importance_sampler.get_distribution();
 
-    Vec8f distribution_sum_left(Zero_SIMD);
-    Vec8f distribution_sum_right(Zero_SIMD);
-
-    if (!cosines_loaded)
-    {
-        std::lock_guard<std::mutex> guard(cosine_mutex);
-
-        if(!cosines_loaded)
-        {
-            char* data = reinterpret_cast<char*>(cosines);
-            std::ifstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::in | std::ios::binary);
-            file.read(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
-            file.close();
-
-            cosines_loaded = true;
-        }
-    }
+    Vec4f distribution_sum(Zero_SIMD);
 
     Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
     bsdf_proxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
 
-    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(ProxyWidth);
-    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(ProxyWidth);
+    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(ProxyWidth * PixelOutWidth);
+    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(ProxyWidth * PixelOutWidth);
 
     Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
     Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
 
-    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), ProxyWidth - 1);
-    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), ProxyWidth - 1);
-    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), ProxyWidth - 1);
-    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), ProxyWidth - 1);
+    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), ProxyWidth * PixelOutWidth - 1);
+    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), ProxyWidth * PixelOutWidth - 1);
+    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), ProxyWidth * PixelOutWidth - 1);
+    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), ProxyWidth * PixelOutWidth - 1);
 
-    const float* diffuse_cosines_array = &cosines[(diffuse_pixel.y * ProxyWidth + diffuse_pixel.x) * ProxyWidth * ProxyWidth];
-    const float* reflectance_cosines_array = &cosines[(reflectance_pixel.y * ProxyWidth + reflectance_pixel.x) * ProxyWidth * ProxyWidth];
+
+    const size_t index_diffuse = (diffuse_pixel.y * ProxyWidth * PixelOutWidth + diffuse_pixel.x) * ProxyWidth * ProxyWidth;
+
+    const size_t alpha = bsdf_proxy.m_reflection_roughness * 0.5f * alpha_steps;
+    const size_t index_reflect = alpha * ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth +
+                   (reflectance_pixel.y * ProxyWidth * PixelOutWidth + reflectance_pixel.x) * ProxyWidth * ProxyWidth;
+
+    const float* diffuse = &diffuse_table[index_diffuse];
+    const float* reflect = &reflectance_table[index_reflect];
+
+    const Vec4f diffuse_weight(bsdf_proxy.m_diffuse_weight);
+    const Vec4f reflect_weight(bsdf_proxy.m_reflection_weight);
 
     for (size_t y = 0; y < ProxyWidth; ++y)
     {
-        const Vec8i pixel_y(y);
+        const Vec4i pixel_y(y);
 
-        for (size_t x = 0; x < ProxyWidth; x += 8)
+        for (size_t x = 0; x < ProxyWidth; x += 4)
         {
-            const Vec8i pixel_x = Vec8i(x) + simd_loop_offsets;
+            const Vec4i pixel_x = Vec4i(x) + simd_loop_offsets;
 
             const size_t index = y * ProxyWidth + x;
 
+            Vec4f diffuse_integral, reflect_integral;
+            diffuse_integral.load(&diffuse[index]);
+            reflect_integral.load(&reflect[index]);
 
-#ifdef LOAD_INCOMING_ARRAY
-            const Vec8f &incoming_x = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3));
-            const Vec8f &incoming_y = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3 + 8));
-            const Vec8f &incoming_z = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3 + 2 * 8));
-            // incoming_x.load_a(worldDir_soa + (index * 3));
-            // incoming_y.load_a(worldDir_soa + (index * 3 + 8));
-            // incoming_z.load_a(worldDir_soa + (index * 3 + 2 * 8));
-#else
-            const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
-            const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
-            canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
-#endif
-            Vec8f diffuse_cosines, reflectance_cosines;
-            diffuse_cosines.load_a(&diffuse_cosines_array[index]);
-            reflectance_cosines.load_a(&reflectance_cosines_array[index]);
-
-            const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z, diffuse_cosines, reflectance_cosines);
-            Vec8f radiance;
+            Vec4f bsdf_proxy_value = diffuse_weight * diffuse_integral;
+            bsdf_proxy_value += reflect_weight * select(diffuse_integral > Zero_SIMD, reflect_integral, Zero_SIMD);
+            Vec4f radiance;
             radiance.load(&((*m_parent_map)[index]));
             radiance *= bsdf_proxy_value;
             radiance.store(&m_map[index]);
 
-            if (x == 0)
-            {
-                distribution_sum_left += select(radiance > Zero_SIMD, radiance, Zero_SIMD);
-                distribution_sum_left.store(&distribution[index]);
-            }
-            else
-            {
-                distribution_sum_right += select(radiance > Zero_SIMD, radiance, Zero_SIMD);
-                distribution_sum_right.store(&distribution[index]);
-            }
+            distribution_sum += select(radiance > Zero_SIMD, radiance, Zero_SIMD);
+            distribution_sum.store(&distribution[index]);
         }
     }
-
-    // float cosines[ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth];
-
-    // for (size_t dest_y = 0; dest_y < ProxyWidth; ++dest_y)
-    // {
-    //     for (size_t dest_x = 0; dest_x < ProxyWidth; ++dest_x)
-    //     {
-    //         const Point2u dest_pixel(dest_x, dest_y);
-    //         size_t dest_index = dest_y * ProxyWidth + dest_x;
-
-    //         for (size_t y = 0; y < ProxyWidth; ++y)
-    //         {
-    //             for (size_t x = 0; x < ProxyWidth; ++x)
-    //             {
-    //                 const Point2u incoming_pixel(x, y);
-    //                 size_t index = y * ProxyWidth + x;
-
-    //                 const float cos_theta = cos_theta_to_boundary(incoming_pixel, dest_pixel, ProxyWidth);
-    //                 cosines[dest_index * ProxyWidth * ProxyWidth + index] = cos_theta;
-
-    //                 if (cos_theta > M_PI / 4.0f && cos_theta != 1.0f)
-    //                 {
-    //                     const float cos_theta_2 = cos_theta_to_boundary(incoming_pixel, dest_pixel, ProxyWidth);
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
-
-    // const char* data = reinterpret_cast<const char*>(cosines);
-    // std::ofstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::out | std::ios::binary);
-    // file.write(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
-    // file.close();
 
     m_image_importance_sampler.build();
 }
@@ -1142,7 +1255,8 @@ float RadianceProxy::proxy_radiance(
 
 float RadianceProxy::sample(
     Sampler *sampler,
-    Vector3f &direction) const
+    Vector3f &direction,
+    const BSDFProxy& bsdfProxy) const
 {
     assert(m_is_built);
     assert(m_product_is_built);
@@ -1175,9 +1289,10 @@ float RadianceProxy::sample(
     if (sub_tree)
     {
         assert(m_quadtree_nodes != nullptr);
-        const Point2 sub_direction = sub_tree->sample(sampler, *m_quadtree_nodes);
+        const float inv_width = 1.0f / ProxyWidth;
+        const Point2 sub_direction = sub_tree->sample_product(sampler, *m_quadtree_nodes, bsdfProxy, cylindrical_direction * inv_width, Point2f(0.5f * inv_width));
         Point2 sub_direction_pdf_eval = sub_direction;
-        const float tree_pdf = sub_tree->pdf(sub_direction_pdf_eval, *m_quadtree_nodes);
+        const float tree_pdf = sub_tree->pdf_product(sub_direction_pdf_eval, *m_quadtree_nodes, bsdfProxy, cylindrical_direction * inv_width, Point2f(0.5f * inv_width));
         cylindrical_direction += sub_direction;
         pdf *= tree_pdf;
     }
@@ -1199,7 +1314,8 @@ float RadianceProxy::sample(
 }
 
 float RadianceProxy::pdf(
-    const Vector3f &direction) const
+    const Vector3f &direction,
+    const BSDFProxy &bsdfProxy) const
 {
     assert(m_is_built);
     assert(m_product_is_built);
@@ -1236,8 +1352,10 @@ float RadianceProxy::pdf(
     if (sub_tree)
     {
         assert(m_quadtree_nodes != nullptr);
+        const float inv_width = 1.0f / ProxyWidth;
+        const Point2f org(pixel.x * inv_width, pixel.y * inv_width);
         Point2f sub_direction(cylindrical_direction_scaled.x - pixel.x, cylindrical_direction_scaled.y - pixel.y);
-        pdf *= sub_tree->pdf(sub_direction, *m_quadtree_nodes);
+        pdf *= sub_tree->pdf_product(sub_direction, *m_quadtree_nodes, bsdfProxy, org, Point2f(0.5f * inv_width));
     }
 
     pdf *= ProxyWidth * ProxyWidth * INV_FOURPI;
@@ -1324,6 +1442,16 @@ public:
         return m_nodes[0].pdf(p, m_nodes) / (4 * M_PI);
     }
 
+    Float pdf_product(Point2 p, const BSDFProxy &bsdfProxy, const Point2f &origin, const Point2f &width) const
+    {
+        if (!(mean() > 0))
+        {
+            return 1 / (4 * M_PI);
+        }
+
+        return m_nodes[0].pdf_product(p, m_nodes, bsdfProxy, origin, width) / (4 * M_PI);
+    }
+
     int depthAt(Point2 p) const {
         return m_nodes[0].depthAt(p, m_nodes);
     }
@@ -1338,6 +1466,21 @@ public:
         }
 
         Point2 res = m_nodes[0].sample(sampler, m_nodes);
+
+        res.x = math::clamp(res.x, 0.0f, 1.0f);
+        res.y = math::clamp(res.y, 0.0f, 1.0f);
+
+        return res;
+    }
+
+    Point2 sample_product(Sampler *sampler, const BSDFProxy &bsdfProxy, const Point2f &origin, const Point2f &width) const
+    {
+        if (!(mean() > 0))
+        {
+            return sampler->next2D();
+        }
+
+        Point2 res = m_nodes[0].sample_product(sampler, m_nodes, bsdfProxy, origin, width);
 
         res.x = math::clamp(res.x, 0.0f, 1.0f);
         res.y = math::clamp(res.y, 0.0f, 1.0f);
@@ -1599,8 +1742,18 @@ public:
         return canonicalToDir(sampling.sample(sampler));
     }
 
+    Vector sample_product(Sampler *sampler, const BSDFProxy &bsdfProxy, const Point2f &origin, const Point2f &width) const
+    {
+        return canonicalToDir(sampling.sample_product(sampler, bsdfProxy, origin, width));
+    }
+
     Float pdf(const Vector& dir) const {
         return sampling.pdf(dirToCanonical(dir));
+    }
+
+    Float pdf_product(const Vector &dir, const BSDFProxy &bsdfProxy, const Point2f &origin, const Point2f &width) const
+    {
+        return sampling.pdf_product(dirToCanonical(dir), bsdfProxy, origin, width);
     }
 
     Float diff(const DTreeWrapper& other) const {
@@ -1902,6 +2055,29 @@ public:
         Vector size = m_aabb.max - m_aabb.min;
         Float maxSize = std::max(std::max(size.x, size.y), size.z);
         m_aabb.max = m_aabb.min + Vector(maxSize);
+
+        // Load proxy table
+        const size_t array_size = alpha_steps * PROXYWIDTH * PROXYWIDTH * PROXYWIDTH * PROXYWIDTH * PixelOutWidth * PixelOutWidth;
+
+        std::ifstream file_diffuse("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_diffuse_4x4.bin", std::ios::in | std::ios::binary);
+
+        if (file_diffuse.is_open())
+        {
+            // Storage for diffuse and reflectance tables
+            m_proxy_table_diffuse.reserve(array_size);
+            file_diffuse.read((char *)m_proxy_table_diffuse.data(), array_size * sizeof(float));
+            file_diffuse.close();
+        }
+
+        std::ifstream file_reflect("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_reflect_4x4.bin", std::ios::in | std::ios::binary);
+
+        if (file_reflect.is_open())
+        {
+            // Storage for diffuse and reflectance tables
+            m_proxy_table_reflect.reserve(array_size);
+            file_reflect.read((char *)m_proxy_table_reflect.data(), array_size * sizeof(float));
+            file_reflect.close();
+        }
     }
 
     void clear() {
@@ -2046,9 +2222,21 @@ public:
         return m_aabb;
     }
 
+    const float *get_proxy_table_diffuse() const
+    {
+        return m_proxy_table_diffuse.data();
+    }
+
+    const float *get_proxy_table_reflect() const
+    {
+        return m_proxy_table_reflect.data();
+    }
+
 private:
     std::vector<STreeNode> m_nodes;
     AABB m_aabb;
+    std::vector<float> m_proxy_table_diffuse;
+    std::vector<float> m_proxy_table_reflect;
 };
 
 
@@ -2131,7 +2319,7 @@ public:
         m_bsdfSamplingFraction = 0.1f;
         m_productSamplingFraction = 1.0f;
         m_useRR = true;
-        m_maxProductAwareBounces = 1;
+        m_maxProductAwareBounces = -1;
     }
 
     ref<BlockedRenderProcess> renderPass(Scene *scene,
@@ -2697,7 +2885,7 @@ public:
         }
     }
 
-    void setGuidingMode(const BSDF *bsdf, const BSDFSamplingRecord &bRec, RadianceProxy &radianceProxy, const DTreeWrapper *dTree, Float &bsdfSamplingFraction, Float &productSamplingFraction, EGuidingMode &guidingMode, EGuidingMode& bounceMode, int& maxProductAwareBounces) const
+    void setGuidingMode(const BSDF *bsdf, const BSDFSamplingRecord &bRec, RadianceProxy &radianceProxy, const DTreeWrapper *dTree, Float &bsdfSamplingFraction, Float &productSamplingFraction, EGuidingMode &guidingMode, EGuidingMode& bounceMode, int& maxProductAwareBounces, BSDFProxy& bsdfProxy, const float* diffuse_table, const float* reflect_table) const
     {
         auto type = bsdf->getType();
         const bool canUseGuiding = m_isBuilt && dTree && (type & BSDF::EDelta) != (type & BSDF::EAll);
@@ -2717,14 +2905,13 @@ public:
                 if (m_guidingMode == EGuidingMode::EProduct)
                 {
                     // Try Init product guiding
-                    BSDFProxy bsdfProxy;
                     bool flipNormal;
                     const bool useProductGuiding = radianceProxy.is_built() && bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
                     const Vector proxyNormal = flipNormal ? -Vector(bRec.its.shFrame.n) : Vector(bRec.its.shFrame.n);
 
                     if (useProductGuiding)
                     {
-                        radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal);
+                        radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_table, reflect_table);
                         bsdfSamplingFraction = m_bsdfSamplingFraction;
                         productSamplingFraction = 1.0f;
                     }
@@ -2746,14 +2933,13 @@ public:
                 if (maxProductAwareBounces != 0 && (m_guidingMode == EGuidingMode::EProduct || m_guidingMode == EGuidingMode::ECombined))
                 {
                     // Try Init product guiding
-                    BSDFProxy bsdfProxy;
                     bool flipNormal;
                     const bool useProductGuiding = radianceProxy.is_built() && bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
                     const Vector proxyNormal = flipNormal ? -Vector(bRec.its.shFrame.n) : Vector(bRec.its.shFrame.n);
 
                     if (useProductGuiding)
                     {
-                        radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal);
+                        radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_table, reflect_table);
                         --maxProductAwareBounces;
                     }
                     else // Path guiding
@@ -2797,7 +2983,7 @@ public:
         }
     }
 
-    Spectrum sampleMat(const BSDF* bsdf, const RadianceProxy& radianceProxy, BSDFSamplingRecord& bRec, Float& woPdf, Float& bsdfPdf, Float& dTreePdf, Float& productPdf, const Float bsdfSamplingFraction, const Float productSamplingFraction, RadianceQueryRecord& rRec, const DTreeWrapper* dTree) const {
+    Spectrum sampleMat(const BSDF* bsdf, const RadianceProxy& radianceProxy, BSDFSamplingRecord& bRec, Float& woPdf, Float& bsdfPdf, Float& dTreePdf, Float& productPdf, const Float bsdfSamplingFraction, const Float productSamplingFraction, RadianceQueryRecord& rRec, const DTreeWrapper* dTree, const BSDFProxy& bsdfProxy) const {
         Point2 sample = rRec.nextSample2D();
 
         // auto type = bsdf->getType();
@@ -2831,7 +3017,7 @@ public:
             if (sample.y < productSamplingFraction)
             {
                 Vector wo;
-                radianceProxy.sample(rRec.sampler, wo);
+                radianceProxy.sample(rRec.sampler, wo, bsdfProxy);
                 bRec.wo = bRec.its.toLocal(wo);
             }
             // else D-Tree guiding
@@ -2842,7 +3028,7 @@ public:
             result = bsdf->eval(bRec);
         }
 
-        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bRec, dTree);
+        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bRec, dTree, bsdfProxy);
         if (woPdf == 0) {
             return Spectrum{0.0f};
         }
@@ -2850,7 +3036,7 @@ public:
         return result / woPdf;
     }
 
-    void pdfMat(Float &woPdf, Float &bsdfPdf, Float &dTreePdf, Float &productPdf, Float bsdfSamplingFraction, Float productSamplingFraction, const BSDF *bsdf, const RadianceProxy &radianceProxy, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree) const
+    void pdfMat(Float &woPdf, Float &bsdfPdf, Float &dTreePdf, Float &productPdf, Float bsdfSamplingFraction, Float productSamplingFraction, const BSDF *bsdf, const RadianceProxy &radianceProxy, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree, const BSDFProxy &bsdfProxy) const
     {
         productPdf = dTreePdf = 0;
 
@@ -2868,7 +3054,7 @@ public:
         }
 
         dTreePdf = dTree->pdf(bRec.its.toWorld(bRec.wo));
-        productPdf = productSamplingFraction == 0.0f ? 0.0f : radianceProxy.pdf(bRec.its.toWorld(bRec.wo));
+        productPdf = productSamplingFraction == 0.0f ? 0.0f : radianceProxy.pdf(bRec.its.toWorld(bRec.wo), bsdfProxy);
             
         woPdf = bsdfSamplingFraction * bsdfPdf + (1.0f - bsdfSamplingFraction) * (productSamplingFraction * productPdf + (1.0f - productSamplingFraction) * dTreePdf);
     }
@@ -3139,12 +3325,14 @@ public:
                 EGuidingMode guidingMode;
                 EGuidingMode bounceMode;
                 RadianceProxy radianceProxy;
+                BSDFProxy bsdfProxy;
+
                 if (dTree)
                     radianceProxy.set_maps(dTree->getRadianceProxy());
 
-                setGuidingMode(bsdf, bRec, radianceProxy, dTree, bsdfSamplingFraction, productSamplingFraction, guidingMode, bounceMode, maxProductAwareBounces);
+                setGuidingMode(bsdf, bRec, radianceProxy, dTree, bsdfSamplingFraction, productSamplingFraction, guidingMode, bounceMode, maxProductAwareBounces, bsdfProxy, m_sdTree->get_proxy_table_diffuse(), m_sdTree->get_proxy_table_reflect());
 
-                Spectrum bsdfWeight = sampleMat(bsdf, radianceProxy, bRec, woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, rRec, dTree);
+                Spectrum bsdfWeight = sampleMat(bsdf, radianceProxy, bRec, woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, rRec, dTree, bsdfProxy);
 
                 // Visualize RadianceProxy
                 // if (m_isFinalIter && dTree)
@@ -3228,7 +3416,7 @@ public:
                             const Emitter *emitter = static_cast<const Emitter *>(dRec.object);
                             Float woPdf = 0, bsdfPdf = 0, dTreePdf = 0;
                             if (emitter->isOnSurface() && dRec.measure == ESolidAngle) {
-                                pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bRec, dTree);
+                                pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bRec, dTree, bsdfProxy);
                             }
 
                             /* Weight using the power heuristic */
