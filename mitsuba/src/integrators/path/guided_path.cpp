@@ -1673,9 +1673,10 @@ public:
         Float samplingFraction = bsdfSamplingFraction(variable);
 
         // Loss gradient w.r.t. sampling fraction
-        Float mixPdf = samplingFraction * rec.bsdfPdf + (1 - samplingFraction) * rec.dTreePdf;
+        const Float guidedPdf = rec.bounceMode == EGuidingMode::EProduct ? rec.productPdf : rec.dTreePdf;
+        Float mixPdf = samplingFraction * rec.bsdfPdf + (1 - samplingFraction) * guidedPdf;
         Float ratio = std::pow(rec.product / mixPdf, ratioPower);
-        Float dLoss_dSamplingFraction = -ratio / rec.woPdf * (rec.bsdfPdf - rec.dTreePdf);
+        Float dLoss_dSamplingFraction = -ratio / rec.woPdf * (rec.bsdfPdf - guidedPdf);
 
         // Chain rule to get loss gradient w.r.t. trainable variable
         Float dLoss_dVariable = dLoss_dSamplingFraction * dBsdfSamplingFraction_dVariable(variable);
@@ -2131,7 +2132,7 @@ public:
         m_bsdfSamplingFraction = 0.1f;
         m_productSamplingFraction = 1.0f;
         m_useRR = true;
-        m_maxProductAwareBounces = 1;
+        m_maxProductAwareBounces = -1;
     }
 
     ref<BlockedRenderProcess> renderPass(Scene *scene,
@@ -2867,7 +2868,7 @@ public:
             return;
         }
 
-        dTreePdf = dTree->pdf(bRec.its.toWorld(bRec.wo));
+        dTreePdf = productSamplingFraction != 1.0f ? dTree->pdf(bRec.its.toWorld(bRec.wo)) : 0.0f;
         productPdf = productSamplingFraction == 0.0f ? 0.0f : radianceProxy.pdf(bRec.its.toWorld(bRec.wo));
             
         woPdf = bsdfSamplingFraction * bsdfPdf + (1.0f - bsdfSamplingFraction) * (productSamplingFraction * productPdf + (1.0f - productSamplingFraction) * dTreePdf);
