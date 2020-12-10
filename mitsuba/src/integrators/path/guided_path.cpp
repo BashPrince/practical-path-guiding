@@ -650,7 +650,7 @@ public:
         }
     }
 
-    Float pdf_product(Point2 &p, const std::vector<QuadTreeNode> &nodes, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const float diffuse_weight, const float reflect_weight) const
+    Float pdf_product(Point2 &p, const std::vector<QuadTreeNode> &nodes, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
     {
         SAssert(p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1);
         const int index = childIndex(p);
@@ -658,57 +658,57 @@ public:
             return 0;
         }
 
-        bool use_product = mip_entries <= PROXYWIDTH * PROXYWIDTH;
         Float factor;
 
-        Float bsdf_proxy[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float bsdf_proxy[4];
 
-        if (use_product)
-        {
-            const size_t offset = mip_offset;
+        Vec4f d_val, r_val;
+        d_val.load(mip_map_diffuse + mip_offset);
+        r_val.load(mip_map_reflect + mip_offset);
 
-            bsdf_proxy[0] = diffuse_weight * mip_map_diffuse[offset] + reflect_weight * (mip_map_diffuse[offset] > 0.0f ? mip_map_reflect[offset] : 0.0f);
-            bsdf_proxy[1] = diffuse_weight * mip_map_diffuse[offset + 1] + reflect_weight * (mip_map_diffuse[offset + 1] > 0.0f ? mip_map_reflect[offset + 1] : 0.0f);
-            bsdf_proxy[2] = diffuse_weight * mip_map_diffuse[offset + 2] + reflect_weight * (mip_map_diffuse[offset + 2] > 0.0f ? mip_map_reflect[offset + 2] : 0.0f);
-            bsdf_proxy[3] = diffuse_weight * mip_map_diffuse[offset + 3] + reflect_weight * (mip_map_diffuse[offset + 3] > 0.0f ? mip_map_reflect[offset + 3] : 0.0f);
-        }
+        const Vec4f Zero(0.0f);
+        (diffuse_weight * d_val + reflect_weight * select(d_val > Zero, r_val, Zero)).store(bsdf_proxy);
 
         Float total = sum(0) * bsdf_proxy[0] + sum(1) * bsdf_proxy[1] + sum(2) * bsdf_proxy[2] + sum(3) * bsdf_proxy[3];
 
+        bool use_product = true;
+
         if (!(total > 0.0f))
         {
-            if (use_product)
-            {
-                bsdf_proxy[0] = 1.0f;
-                bsdf_proxy[1] = 1.0f;
-                bsdf_proxy[2] = 1.0f;
-                bsdf_proxy[3] = 1.0f;
+            total = sum(0) + sum(1) + sum(2) + sum(3);
 
-                total = sum(0) + sum(1) + sum(2) + sum(3);
-
-                if (!(total > 0.0f))
-                    return 1;
-            }
-            else
-            {
+            if (!(total > 0.0f))
                 return 1;
-            }
+
+            factor = 4 * sum(index) / total;
+            use_product = false;
+        }
+        else
+        {
+            factor = 4 * sum(index) * bsdf_proxy[index] / total;
         }
 
-        factor = 4 * sum(index) * bsdf_proxy[index] / total;
 
         if (isLeaf(index)) {
             return factor;
         } else {
-            return factor * nodes[child(index)].pdf_product(
-                                p,
-                                nodes,
-                                mip_map_diffuse + mip_entries,
-                                mip_map_reflect + mip_entries,
-                                (mip_offset + index) * 4,
-                                use_product ? mip_entries * 4 : PROXYWIDTH * PROXYWIDTH + 1,
-                                diffuse_weight,
-                                reflect_weight);
+            if (use_product && mip_entries * 4 <= PROXYWIDTH * PROXYWIDTH)
+            {
+                return factor * nodes[child(index)].pdf_product(
+                                    p,
+                                    nodes,
+                                    mip_map_diffuse + mip_entries,
+                                    mip_map_reflect + mip_entries,
+                                    (mip_offset + index) * 4,
+                                    mip_entries * 4,
+                                    diffuse_weight,
+                                    reflect_weight);
+
+            }
+            else
+            {
+                return factor * nodes[child(index)].pdf(p, nodes);
+            }
         }
     }
 
@@ -768,28 +768,23 @@ public:
         }
     }
 
-    Point2 sample_product(Sampler *sampler, const std::vector<QuadTreeNode> &nodes, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const float diffuse_weight, const float reflect_weight) const
+    Point2 sample_product(Sampler *sampler, const std::vector<QuadTreeNode> &nodes, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
     {
         int index = 0;
-
-        bool use_product = mip_entries <= PROXYWIDTH * PROXYWIDTH;
 
         Float topLeft;
         Float topRight;
         Float partial;
         Float total = 0.0f;
 
-        Float bsdf_proxy[4] = {1.0f, 1.0f, 1.0f, 1.0f};
- 
-        if (use_product)
-        {
-            const size_t offset = mip_offset;
+        float bsdf_proxy[4];
 
-            bsdf_proxy[0] = diffuse_weight * mip_map_diffuse[offset] + reflect_weight * (mip_map_diffuse[offset] > 0.0f ? mip_map_reflect[offset] : 0.0f);
-            bsdf_proxy[1] = diffuse_weight * mip_map_diffuse[offset + 1] + reflect_weight * (mip_map_diffuse[offset + 1] > 0.0f ? mip_map_reflect[offset + 1] : 0.0f);
-            bsdf_proxy[2] = diffuse_weight * mip_map_diffuse[offset + 2] + reflect_weight * (mip_map_diffuse[offset + 2] > 0.0f ? mip_map_reflect[offset + 2] : 0.0f);
-            bsdf_proxy[3] = diffuse_weight * mip_map_diffuse[offset + 3] + reflect_weight * (mip_map_diffuse[offset + 3] > 0.0f ? mip_map_reflect[offset + 3] : 0.0f);
-        }
+        Vec4f d_val, r_val;
+        d_val.load(mip_map_diffuse + mip_offset);
+        r_val.load(mip_map_reflect + mip_offset);
+
+        const Vec4f Zero(0.0f);
+        (diffuse_weight * d_val + reflect_weight * select(d_val > Zero, r_val, Zero)).store(bsdf_proxy);
 
         topLeft = sum(0) * bsdf_proxy[0];                   
         topRight = sum(1) * bsdf_proxy[1];                  
@@ -797,22 +792,19 @@ public:
         total = partial + topRight + sum(3) * bsdf_proxy[3];
 
         // Should only happen when there are numerical instabilities.
+        bool use_product = true;
+        
         if (!(total > 0.0f))
         {
-            if (use_product)
-            {
-                topLeft = sum(0);
-                topRight = sum(1);
-                partial = topLeft + sum(2);
-                total = partial + topRight + sum(3);
-                
-                if (!(total > 0.0f))
-                    return sampler->next2D();
-            }
-            else
-            {
+            topLeft = sum(0);
+            topRight = sum(1);
+            partial = topLeft + sum(2);
+            total = partial + topRight + sum(3);
+            
+            if (!(total > 0.0f))
                 return sampler->next2D();
-            }
+            
+            use_product = false;
         }
 
         Float boundary = partial / total;
@@ -844,15 +836,22 @@ public:
         if (isLeaf(index)) {
             return origin + 0.5f * sampler->next2D();
         } else {
-            return origin + 0.5f * nodes[child(index)].sample_product(
-                                       sampler,
-                                       nodes,
-                                       mip_map_diffuse + mip_entries,
-                                       mip_map_reflect + mip_entries,
-                                       (mip_offset + index) * 4,
-                                       use_product ? mip_entries * 4 : PROXYWIDTH * PROXYWIDTH + 1,
-                                       diffuse_weight,
-                                       reflect_weight);
+            if (use_product && mip_entries * 4 <= PROXYWIDTH * PROXYWIDTH)
+            {
+                return origin + 0.5f * nodes[child(index)].sample_product(
+                                           sampler,
+                                           nodes,
+                                           mip_map_diffuse + mip_entries,
+                                           mip_map_reflect + mip_entries,
+                                           (mip_offset + index) * 4,
+                                           mip_entries * 4,
+                                           diffuse_weight,
+                                           reflect_weight);
+            }
+            else
+            {
+                return origin + 0.5f * nodes[child(index)].sample(sampler, nodes);
+            }
         }
     }
 
@@ -1490,7 +1489,7 @@ public:
         return m_nodes[0].pdf(p, m_nodes) / (4 * M_PI);
     }
 
-    Float pdf_product(Point2 p, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const float diffuse_weight, const float reflect_weight) const
+    Float pdf_product(Point2 p, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
     {
         if (!(mean() > 0)) {
             return 1 / (4 * M_PI);
@@ -1520,7 +1519,7 @@ public:
         return res;
     }
 
-    Point2 sample_product(Sampler *sampler, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const float diffuse_weight, const float reflect_weight) const
+    Point2 sample_product(Sampler *sampler, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
     {
         if (!(mean() > 0)) {
             return sampler->next2D();
@@ -1788,7 +1787,7 @@ public:
         return canonicalToDir(sampling.sample(sampler));
     }
 
-    Vector sample_product(Sampler *sampler, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const float diffuse_weight, const float reflect_weight) const
+    Vector sample_product(Sampler *sampler, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
     {
         return canonicalToDir(sampling.sample_product(sampler, mip_map_diffuse, mip_map_reflect, mip_offset, mip_entries, diffuse_weight, reflect_weight));
     }
@@ -1797,7 +1796,7 @@ public:
         return sampling.pdf(dirToCanonical(dir));
     }
 
-    Float pdf_product(const Vector &dir, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const float diffuse_weight, const float reflect_weight) const
+    Float pdf_product(const Vector &dir, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
     {
         return sampling.pdf_product(dirToCanonical(dir), mip_map_diffuse, mip_map_reflect, mip_offset, mip_entries, diffuse_weight, reflect_weight);
     }
@@ -1872,9 +1871,10 @@ public:
         Float samplingFraction = bsdfSamplingFraction(variable);
 
         // Loss gradient w.r.t. sampling fraction
-        Float mixPdf = samplingFraction * rec.bsdfPdf + (1 - samplingFraction) * rec.dTreePdf;
+        const Float guidedPdf = rec.bounceMode == EGuidingMode::EProduct ? rec.productPdf : rec.dTreePdf;
+        Float mixPdf = samplingFraction * rec.bsdfPdf + (1 - samplingFraction) * guidedPdf;
         Float ratio = std::pow(rec.product / mixPdf, ratioPower);
-        Float dLoss_dSamplingFraction = -ratio / rec.woPdf * (rec.bsdfPdf - rec.dTreePdf);
+        Float dLoss_dSamplingFraction = -ratio / rec.woPdf * (rec.bsdfPdf - guidedPdf);
 
         // Chain rule to get loss gradient w.r.t. trainable variable
         Float dLoss_dVariable = dLoss_dSamplingFraction * dBsdfSamplingFraction_dVariable(variable);
@@ -3151,7 +3151,7 @@ public:
         }
 
         const Vector dir = bRec.its.toWorld(bRec.wo);
-        dTreePdf = dTree->pdf(dir);
+        dTreePdf = productSamplingFraction != 1.0f ? dTree->pdf(dir) : 0.0f;
 
         if (productSamplingFraction == 0.0f)
         {
