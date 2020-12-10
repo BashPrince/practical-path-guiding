@@ -245,7 +245,7 @@ class BSDFProxy
     // TO-DO:
     // Roughness scaling after parameterization.
 
-private:
+// private:
     float m_diffuse_weight, m_reflection_weight, m_refraction_weight, m_translucency_weight;
     float m_reflection_roughness, m_refraction_roughness;
     float m_eta;
