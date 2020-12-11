@@ -55,6 +55,9 @@
 const size_t PixelOutWidth = 2;
 const size_t alpha_steps = 25;
 
+const size_t MipIndexWidth = PROXYWIDTH * PixelOutWidth;
+const size_t MipIndexWidth2 = MipIndexWidth * MipIndexWidth;
+
 MTS_NAMESPACE_BEGIN
 
 class BlobWriter {
@@ -3072,6 +3075,9 @@ public:
         //     return result;
         // }
 
+        bool sampledProduct = false;
+        size_t diffuse_mip_index, reflect_mip_index;
+
         Spectrum result;
         if (sample.x < bsdfSamplingFraction) {
             sample.x /= bsdfSamplingFraction;
@@ -3097,24 +3103,27 @@ public:
                 Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
                 bsdfProxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
 
-                Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(PROXYWIDTH * PixelOutWidth);
-                Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(PROXYWIDTH * PixelOutWidth);
+                Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(MipIndexWidth);
+                Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(MipIndexWidth);
 
                 Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
                 Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
 
-                diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), PROXYWIDTH * PixelOutWidth - 1);
-                diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), PROXYWIDTH * PixelOutWidth - 1);
-                reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), PROXYWIDTH * PixelOutWidth - 1);
-                reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), PROXYWIDTH * PixelOutWidth - 1);
+                const size_t MaxMipIndex = MipIndexWidth - 1;
 
-                const size_t diffuse_mip_index = (diffuse_pixel.y * PROXYWIDTH * PixelOutWidth + diffuse_pixel.x) * mip_entries;
+                diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), MaxMipIndex);
+                diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), MaxMipIndex);
+                reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), MaxMipIndex);
+                reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), MaxMipIndex);
+
+                diffuse_mip_index = (diffuse_pixel.y * MipIndexWidth + diffuse_pixel.x) * mip_entries;
 
                 const size_t alpha_index = (bsdfProxy.m_reflection_roughness * 0.5f) * alpha_steps;
-                const size_t reflect_mip_index = alpha_index * PROXYWIDTH * PROXYWIDTH * PixelOutWidth * PixelOutWidth * mip_entries +
-                                                    (reflectance_pixel.y * PROXYWIDTH * PixelOutWidth + reflectance_pixel.x) * mip_entries;
+                reflect_mip_index = alpha_index * MipIndexWidth2 * mip_entries +
+                                                    (reflectance_pixel.y * MipIndexWidth + reflectance_pixel.x) * mip_entries;
 
                 bRec.wo = bRec.its.toLocal(dTree->sample_product(rRec.sampler, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight));
+                sampledProduct = true;
             }
             // else D-Tree guiding
             else
@@ -3124,7 +3133,7 @@ public:
             result = bsdf->eval(bRec);
         }
 
-        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bsdfProxy, mip_map_diffuse, mip_map_reflect, mip_entries, bRec, dTree);
+        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bsdfProxy, mip_map_diffuse, mip_map_reflect, mip_entries, bRec, dTree, sampledProduct, diffuse_mip_index, reflect_mip_index);
         if (woPdf == 0) {
             return Spectrum{0.0f};
         }
@@ -3133,7 +3142,7 @@ public:
     }
 
     void pdfMat(Float &woPdf, Float &bsdfPdf, Float &dTreePdf, Float &productPdf, Float bsdfSamplingFraction, Float productSamplingFraction, const BSDF *bsdf, const RadianceProxy &radianceProxy, const BSDFProxy& bsdfProxy, const float* const mip_map_diffuse, const float* mip_map_reflect,
-        const size_t mip_entries, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree) const
+        const size_t mip_entries, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree, const bool sampledProduct = false, const size_t diffuse_mip_index = 0, const size_t reflect_mip_index = 0) const
     {
         productPdf = dTreePdf = 0;
 
@@ -3159,27 +3168,36 @@ public:
         }
         else
         {
-            Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
-            bsdfProxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
+            if (!sampledProduct)
+            {
+                Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
+                bsdfProxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
 
-            Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(PROXYWIDTH * PixelOutWidth);
-            Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(PROXYWIDTH * PixelOutWidth);
+                Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(MipIndexWidth);
+                Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(MipIndexWidth);
 
-            Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
-            Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
+                Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
+                Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
 
-            diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), PROXYWIDTH * PixelOutWidth - 1);
-            diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), PROXYWIDTH * PixelOutWidth - 1);
-            reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), PROXYWIDTH * PixelOutWidth - 1);
-            reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), PROXYWIDTH * PixelOutWidth - 1);
+                const size_t MaxMipIndex = MipIndexWidth - 1;
 
-            const size_t diffuse_mip_index = (diffuse_pixel.y * PROXYWIDTH * PixelOutWidth + diffuse_pixel.x) * mip_entries;
+                diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), MaxMipIndex);
+                diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), MaxMipIndex);
+                reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), MaxMipIndex);
+                reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), MaxMipIndex);
 
-            const size_t alpha_index = (bsdfProxy.m_reflection_roughness * 0.5f) * alpha_steps;
-            const size_t reflect_mip_index = alpha_index * PROXYWIDTH * PROXYWIDTH * PixelOutWidth * PixelOutWidth * mip_entries +
-                                             (reflectance_pixel.y * PROXYWIDTH * PixelOutWidth + reflectance_pixel.x) * mip_entries;
+                const size_t diffuse_mip_index = (diffuse_pixel.y * MipIndexWidth + diffuse_pixel.x) * mip_entries;
 
-            productPdf = dTree->pdf_product(dir, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight);
+                const size_t alpha_index = (bsdfProxy.m_reflection_roughness * 0.5f) * alpha_steps;
+                const size_t reflect_mip_index = alpha_index * MipIndexWidth2 * mip_entries +
+                                                (reflectance_pixel.y * MipIndexWidth + reflectance_pixel.x) * mip_entries;
+
+                productPdf = dTree->pdf_product(dir, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight);
+            }
+            else
+            {
+                productPdf = dTree->pdf_product(dir, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight);
+            }
         }
             
         woPdf = bsdfSamplingFraction * bsdfPdf + (1.0f - bsdfSamplingFraction) * (productSamplingFraction * productPdf + (1.0f - productSamplingFraction) * dTreePdf);
