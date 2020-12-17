@@ -2970,13 +2970,14 @@ public:
                 {
                     // Try Init product guiding
                     bool flipNormal;
-                    const bool useProductGuiding = radianceProxy.is_built() && bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
+                    const Vector wiWorld = bRec.its.toWorld(bRec.wi);
+                    const bool useProductGuiding = std::abs(dot(wiWorld, bRec.its.shFrame.n)) > 0.09 && radianceProxy.is_built() && bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
                     const Vector proxyNormal = flipNormal ? -Vector(bRec.its.shFrame.n) : Vector(bRec.its.shFrame.n);
 
                     if (useProductGuiding)
                     {
                         // radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal);
-                        bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), proxyNormal);
+                        bsdfProxy.finish_parameterization(wiWorld, proxyNormal);
                         bsdfSamplingFraction = m_bsdfSamplingFraction;
                         productSamplingFraction = 1.0f;
                     }
