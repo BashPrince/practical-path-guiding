@@ -179,6 +179,9 @@
       iteration. The dumped SD-tree can be visualized with the accompanying
       visualizer tool.
     </param>
+	<param name="useADRR" readableName="Use ADRR" type="boolean" default="true" importance="1">
+      Use ADRR [Jiří Vorba and Jaroslav Křivánek 2016] for speedup.
+    </param>
 	</plugin>
 
 	<plugin type="integrator" name="product_guided_path" readableName="Product Guided Path Tracer"

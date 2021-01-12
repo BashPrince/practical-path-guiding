@@ -392,6 +392,10 @@ public:
         return factor * m_atomic.sum;
     }
 
+    Spectrum getMeasurement() const {
+        return m_atomic.getMeasurement();
+    }
+
     void recordIrradiance(Point2 p, Float irradiance, Float statisticalWeight, EDirectionalFilter directionalFilter) {
         if (std::isfinite(statisticalWeight) && statisticalWeight > 0) {
             addToAtomicFloat(m_atomic.statisticalWeight, statisticalWeight);
@@ -410,6 +414,21 @@ public:
                 }
             }
         }
+    }
+
+    void recordMeasurement(const Spectrum &m)
+    {
+        m_atomic.recordMeasurement(m);
+    }
+
+    Float eval(Point2 p) const
+    {
+        if (m_atomic.statisticalWeight == 0.0f)
+        {
+            return 0.0f;
+        }
+
+        return m_nodes[0].eval(p, m_nodes) / (4.0f * M_PI * m_atomic.statisticalWeight);
     }
 
     Float pdf(Point2 p) const {
@@ -539,20 +558,60 @@ private:
         Atomic() {
             sum.store(0, std::memory_order_relaxed);
             statisticalWeight.store(0, std::memory_order_relaxed);
+
+            measurementR.store(0, std::memory_order_relaxed);
+            measurementG.store(0, std::memory_order_relaxed);
+            measurementB.store(0, std::memory_order_relaxed);
+            nMeasurementSamples = 0;
         }
 
         Atomic(const Atomic& arg) {
             *this = arg;
         }
 
-        Atomic& operator=(const Atomic& arg) {
+        Atomic &operator=(const Atomic &arg)
+        {
             sum.store(arg.sum.load(std::memory_order_relaxed), std::memory_order_relaxed);
             statisticalWeight.store(arg.statisticalWeight.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+            measurementR.store(arg.measurementR.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            measurementG.store(arg.measurementG.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            measurementB.store(arg.measurementB.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            nMeasurementSamples = arg.nMeasurementSamples.load(std::memory_order_relaxed);
+
             return *this;
         }
 
         std::atomic<Float> sum;
         std::atomic<Float> statisticalWeight;
+
+        void recordMeasurement(const Spectrum &val)
+        {
+            ++nMeasurementSamples;
+            addToAtomicFloat(measurementR, val[0]);
+            addToAtomicFloat(measurementG, val[1]);
+            addToAtomicFloat(measurementB, val[2]);
+        }
+
+        Spectrum getMeasurement() const
+        {
+            size_t n = nMeasurementSamples.load(std::memory_order_relaxed);
+            if (n == 0)
+            {
+                return Spectrum{0.0f};
+            }
+
+            Spectrum result;
+            result[0] = measurementR.load(std::memory_order_relaxed);
+            result[1] = measurementG.load(std::memory_order_relaxed);
+            result[2] = measurementB.load(std::memory_order_relaxed);
+            return result / (Float)n;
+        }
+
+        std::atomic<Float> measurementR;
+        std::atomic<Float> measurementG;
+        std::atomic<Float> measurementB;
+        std::atomic<size_t> nMeasurementSamples;
 
     } m_atomic;
 
@@ -581,6 +640,25 @@ public:
         if (bsdfSamplingFractionLoss != EBsdfSamplingFractionLoss::ENone && rec.product > 0) {
             optimizeBsdfSamplingFraction(rec, bsdfSamplingFractionLoss == EBsdfSamplingFractionLoss::EKL ? 1.0f : 2.0f);
         }
+    }
+
+    void recordMeasurement(Spectrum m)
+    {
+        if (!m.isValid())
+        {
+            m = Spectrum{0.0f};
+        }
+        building.recordMeasurement(m);
+    }
+
+    Float estimateRadiance(Point2 p) const
+    {
+        return sampling.eval(p);
+    }
+
+    Float estimateRadiance(const Vector &d) const
+    {
+        return estimateRadiance(dirToCanonical(d));
     }
 
     static Vector canonicalToDir(Point2 p) {
@@ -638,6 +716,10 @@ public:
 
     Float meanRadiance() const {
         return sampling.mean();
+    }
+
+    Spectrum measurementEstimate() const {
+        return sampling.getMeasurement();
     }
 
     Float statisticalWeight() const {
@@ -1082,6 +1164,7 @@ public:
 
         m_budget = props.getFloat("budget", 300.0f);
         m_dumpSDTree = props.getBoolean("dumpSDTree", false);
+        m_useRR = props.getBoolean("useADRR", true);
     }
 
     ref<BlockedRenderProcess> renderPass(Scene *scene,
@@ -1727,6 +1810,10 @@ public:
                 radiance += r;
             }
 
+            void recordMeasurement(Spectrum &r) {
+                dTree->recordMeasurement(r);
+            }
+
             void commit(STree& sdTree, Float statisticalWeight, ESpatialFilter spatialFilter, EDirectionalFilter directionalFilter, EBsdfSamplingFractionLoss bsdfSamplingFractionLoss, Sampler* sampler) {
                 if (!(woPdf > 0) || !radiance.isValid() || !bsdfVal.isValid()) {
                     return;
@@ -1784,6 +1871,7 @@ public:
         rRec.rayIntersect(ray);
 
         Spectrum throughput(1.0f);
+        Spectrum measurementEstimate;
         bool scattered = false;
 
         int nVertices = 0;
@@ -2091,6 +2179,11 @@ public:
                     }
 
                     if ((!isDelta || m_bsdfSamplingFractionLoss != EBsdfSamplingFractionLoss::ENone) && dTree && nVertices < MAX_NUM_VERTICES && !m_isFinalIter) {
+
+                        if (nVertices == 0 && m_isBuilt) {
+                            measurementEstimate = dTree->measurementEstimate();
+                        }
+
                         if (1 / woPdf > 0) {
                             vertices[nVertices] = Vertex{
                                 dTree,
@@ -2121,19 +2214,47 @@ public:
                 rRec.type = RadianceQueryRecord::ERadianceNoEmission;
 
                 // Russian roulette
+                // The adjoint driven Russian Roulette implementation was taken from
+                // "Practical Product Path Guiding Using Linearly Transformed Cosines" [Diolatzis et. al. 2020]
+                // Implementation at https://gitlab.inria.fr/sdiolatz/practical-product-path-guiding
                 if (rRec.depth++ >= m_rrDepth) {
                     Float successProb = 1.0f;
                     if (dTree && !(bRec.sampledType & BSDF::EDelta)) {
                         if (!m_isBuilt) {
                             successProb = throughput.max() * eta * eta;
                         } else {
-                            // The adjoint russian roulette implementation of Mueller et al. [2017]
-                            // was broken, effectively turning off russian roulette entirely.
-                            // For reproducibility's sake, we therefore removed adjoint russian roulette
-                            // from this codebase rather than fixing it.
+                            if (m_useRR)
+                            {
+                                Spectrum incidentRadiance = Spectrum{dTree->estimateRadiance(ray.d)};
+
+                                if (measurementEstimate.min() > 0 && incidentRadiance.min() > 0)
+                                {
+                                    const Float center = (measurementEstimate / incidentRadiance).average();
+                                    const Float s = 5;
+                                    const Float wMin = 2 * center / (1 + s);
+                                    //const Float wMax = wMin * 5; // Useful for splitting
+
+                                    const Float tMax = throughput.max();
+                                    //const Float tMin = throughput.min(); // Useful for splitting
+
+                                    // Splitting is not supported.
+                                    if (tMax < wMin)
+                                    {
+                                        successProb = tMax / wMin;
+                                    }
+                                }
+                            }
                         }
 
                         successProb = std::max(0.1f, std::min(successProb, 0.99f));
+                    } else {
+                        // In some case, we can end up to infinite loop when maxDepth = -1
+                        // due to very very long specular chain. In this case,
+                        // we do RR anyway in the classical way if exceeding very long paths
+                        if (rRec.depth > 40) {
+                            SLog(EWarn, "Reaching maximum depth for specular chain. Activating RR");
+                            successProb = throughput.max() * eta * eta;
+                        }
                     }
 
                     if (rRec.nextSample1D() >= successProb)
@@ -2148,6 +2269,7 @@ public:
         avgPathLength += rRec.depth;
 
         if (nVertices > 0 && !m_isFinalIter) {
+            vertices[0].recordMeasurement(Li);
             for (int i = 0; i < nVertices; ++i) {
                 vertices[i].commit(*m_sdTree, m_nee == EKickstart && m_doNee ? 0.5f : 1.0f, m_spatialFilter, m_directionalFilter, m_isBuilt ? m_bsdfSamplingFractionLoss : EBsdfSamplingFractionLoss::ENone, rRec.sampler);
             }
@@ -2410,6 +2532,12 @@ private:
         Default = false
     */
     bool m_dumpSDTree;
+
+    /**
+        Whether to use Adjoint-based Russian Roulette
+        Default = true
+    */
+    bool m_useRR;
 
     /// The time at which rendering started.
     std::chrono::steady_clock::time_point m_startTime;
