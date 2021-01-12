@@ -2381,8 +2381,6 @@ public:
         m_budget = props.getFloat("budget", 300.0f);
         m_dumpSDTree = props.getBoolean("dumpSDTree", false);
 
-        m_bsdfSamplingFraction = 0.1f;
-        m_productSamplingFraction = 1.0f;
         m_useRR = props.getBoolean("useADRR", true);
         m_maxProductAwareBounces = props.getInteger("maxProductAwareBounces", -1);
     }
@@ -4056,7 +4054,6 @@ private:
 
     EGuidingMode m_guidingMode = EGuidingMode::EProduct;
     int m_maxProductAwareBounces;
-    Float m_productSamplingFraction;
 
 public:
     MTS_DECLARE_CLASS()
