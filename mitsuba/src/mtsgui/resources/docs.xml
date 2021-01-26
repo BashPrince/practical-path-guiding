@@ -275,6 +275,9 @@
 	<param name="maxProductAwareBounces" readableName="Max product bounces" type="integer" default="-1" importance="1">
 	  Limit the maximum number of possible product guiding bounces.
     </param>
+	<param name="useHierarchicalProduct" readableName="Use hierarchical product sampling" type="boolean" default="true" importance="1">
+	  Use hierarchical sample warping for sampling the product or slower distribution building method.
+    </param>
 	</plugin>
 
 	<plugin type="integrator" name="adaptive" readableName="Adaptive integrator"

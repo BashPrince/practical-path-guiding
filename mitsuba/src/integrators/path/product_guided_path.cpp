@@ -40,7 +40,8 @@
 
 #define BUILD_SIMD_PRODUCT
 #define PROXYWIDTH 32
-#define LOAD_INCOMING_ARRAY
+#define PRODUCTPROXYWIDTH 16
+// #define LOAD_INCOMING_ARRAY
 
 #ifdef LOAD_INCOMING_ARRAY
 #if PROXYWIDTH == 32
@@ -53,7 +54,7 @@
 #endif
 
 const size_t PixelOutWidth = 2;
-const size_t alpha_steps = 25;
+const size_t alpha_steps = 50;
 
 const size_t MipIndexWidth = PROXYWIDTH * PixelOutWidth;
 const size_t MipIndexWidth2 = MipIndexWidth * MipIndexWidth;
@@ -91,33 +92,6 @@ static void addToAtomicFloat(std::atomic<Float>& var, Float val) {
 
 inline Float logistic(Float x) {
     return 1 / (1 + std::exp(-x));
-}
-
-inline Vector canonicalToDir(Point2 p)
-{
-    const Float cosTheta = 2 * p.x - 1;
-    const Float phi = 2 * M_PI * p.y;
-
-    const Float sinTheta = sqrt(1 - cosTheta * cosTheta);
-    Float sinPhi, cosPhi;
-    math::sincos(phi, &sinPhi, &cosPhi);
-
-    return {sinTheta * cosPhi, sinTheta * sinPhi, cosTheta};
-}
-
-inline Point2 dirToCanonical(const Vector &d)
-{
-    if (!std::isfinite(d.x) || !std::isfinite(d.y) || !std::isfinite(d.z))
-    {
-        return {0, 0};
-    }
-
-    const Float cosTheta = std::min(std::max(d.z, -1.0f), 1.0f);
-    Float phi = std::atan2(d.y, d.x);
-    while (phi < 0)
-        phi += 2.0 * M_PI;
-
-    return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
 }
 
 inline void canonicalToDir_simd(const Vec8f &p_x, const Vec8f &p_y, Vec8f &outDir_x, Vec8f &outDir_y, Vec8f &outDir_z)
@@ -420,7 +394,9 @@ public:
     void build_product(
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
-        const Vector3f &shading_normal);
+        const Vector3f &shading_normal,
+        const float* diffuse_proxy_table,
+        const float* reflect_proxy_table);
 
     void build_product_scalar(
         BSDFProxy &bsdf_proxy,
@@ -430,8 +406,10 @@ public:
     void build_product_simd(
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
-        const Vector3f &shading_normal);
-    
+        const Vector3f &shading_normal,
+        const float *diffuse_proxy_table,
+        const float *reflect_proxy_table);
+
     void clear();
 
     float proxy_radiance(
@@ -449,7 +427,7 @@ public:
     void set_maps(const RadianceProxy& other);
     void set_table(const std::vector<float>* proxy_table);
 
-    static const size_t ProxyWidth = PROXYWIDTH;
+    static const size_t ProxyWidth = PRODUCTPROXYWIDTH;
 
     template <size_t Width>
     class ImageImportanceSampler
@@ -543,19 +521,19 @@ public:
         }
 
     private:
-        std::array<float, PROXYWIDTH> marginalDistribution;
-        std::array<float, PROXYWIDTH * PROXYWIDTH> distribution;
+        std::array<float, PRODUCTPROXYWIDTH> marginalDistribution;
+        std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH> distribution;
         float totalRadiance;
         bool isZero = false;
     };
 
-    ImageImportanceSampler<PROXYWIDTH> m_image_importance_sampler;
+    ImageImportanceSampler<PRODUCTPROXYWIDTH> m_image_importance_sampler;
 
-    std::array<float, PROXYWIDTH * PROXYWIDTH> m_map;
-    const std::array<float, PROXYWIDTH * PROXYWIDTH>* m_parent_map;
+    std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH> m_map;
+    const std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH>* m_parent_map;
 
     std::shared_ptr<
-        std::array<const QuadTreeNode *, PROXYWIDTH * PROXYWIDTH>>
+        std::array<const QuadTreeNode *, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH>>
         m_quadtree_strata;
 
     bool m_product_is_built;
@@ -653,7 +631,7 @@ public:
         }
     }
 
-    Float pdf_product(Point2 &p, const std::vector<QuadTreeNode> &nodes, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
+    Float pdf_product(Point2 &p, const std::vector<QuadTreeNode> &nodes, const float *const mip_map_diffuse, const float *const mip_map_reflect, const float *const mip_map_refract, const size_t mip_offset, const size_t mip_entries, const Vec4f &diffuse_weight, const Vec4f &reflect_weight, const Vec4f &refract_weight, const bool flip_refraction, const bool flip_reflection) const
     {
         SAssert(p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1);
         const int index = childIndex(p);
@@ -665,12 +643,23 @@ public:
 
         float bsdf_proxy[4];
 
-        Vec4f d_val, r_val;
-        d_val.load(mip_map_diffuse + mip_offset);
-        r_val.load(mip_map_reflect + mip_offset);
-
         const Vec4f Zero(0.0f);
-        (diffuse_weight * d_val + reflect_weight * select(d_val > Zero, r_val, Zero)).store(bsdf_proxy);
+        Vec4f diffuse_val, reflection_val, refraction_val;
+        diffuse_val.load(mip_map_diffuse + mip_offset);
+        reflection_val.load(mip_map_reflect + mip_offset);
+        reflection_val = flip_reflection ? select(diffuse_val == Zero, reflection_val, Zero) : select(diffuse_val > Zero, reflection_val, Zero);
+
+        if (mip_map_refract)
+        {
+            refraction_val.load(mip_map_refract + mip_offset);
+            refraction_val = flip_refraction ? select(diffuse_val > Zero, refraction_val, Zero) : select(diffuse_val == Zero, refraction_val, Zero);
+        }
+        else
+        {
+            refraction_val = Vec4f(0.0f);
+        }
+
+        (diffuse_weight * diffuse_val + reflect_weight * reflection_val + refract_weight * refraction_val).store(bsdf_proxy);
 
         Float total = sum(0) * bsdf_proxy[0] + sum(1) * bsdf_proxy[1] + sum(2) * bsdf_proxy[2] + sum(3) * bsdf_proxy[3];
 
@@ -702,11 +691,14 @@ public:
                                     nodes,
                                     mip_map_diffuse + mip_entries,
                                     mip_map_reflect + mip_entries,
+                                    mip_map_refract ? mip_map_refract + mip_entries : nullptr,
                                     (mip_offset + index) * 4,
                                     mip_entries * 4,
                                     diffuse_weight,
-                                    reflect_weight);
-
+                                    reflect_weight,
+                                    refract_weight,
+                                    flip_refraction,
+                                    flip_reflection);
             }
             else
             {
@@ -771,7 +763,7 @@ public:
         }
     }
 
-    Point2 sample_product(Sampler *sampler, const std::vector<QuadTreeNode> &nodes, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
+    Point2 sample_product(Sampler *sampler, const std::vector<QuadTreeNode> &nodes, const float *const mip_map_diffuse, const float *const mip_map_reflect, const float *const mip_map_refract, const size_t mip_offset, const size_t mip_entries, const Vec4f &diffuse_weight, const Vec4f &reflect_weight, const Vec4f &refract_weight, const bool flip_refraction, const bool flip_reflection) const
     {
         int index = 0;
 
@@ -782,12 +774,23 @@ public:
 
         float bsdf_proxy[4];
 
-        Vec4f d_val, r_val;
-        d_val.load(mip_map_diffuse + mip_offset);
-        r_val.load(mip_map_reflect + mip_offset);
-
         const Vec4f Zero(0.0f);
-        (diffuse_weight * d_val + reflect_weight * select(d_val > Zero, r_val, Zero)).store(bsdf_proxy);
+        Vec4f diffuse_val, reflection_val, refraction_val;
+        diffuse_val.load(mip_map_diffuse + mip_offset);
+        reflection_val.load(mip_map_reflect + mip_offset);
+        reflection_val = flip_reflection ? select(diffuse_val == Zero, reflection_val, Zero) : select(diffuse_val > Zero, reflection_val, Zero);
+
+        if (mip_map_refract)
+        {
+            refraction_val.load(mip_map_refract + mip_offset);
+            refraction_val = flip_refraction ? select(diffuse_val > Zero, refraction_val, Zero) : select(diffuse_val == Zero, refraction_val, Zero);
+        }
+        else
+        {
+            refraction_val = Vec4f(0.0f);
+        }
+
+        (diffuse_weight * diffuse_val + reflect_weight * reflection_val + refract_weight * refraction_val).store(bsdf_proxy);
 
         topLeft = sum(0) * bsdf_proxy[0];                   
         topRight = sum(1) * bsdf_proxy[1];                  
@@ -846,10 +849,14 @@ public:
                                            nodes,
                                            mip_map_diffuse + mip_entries,
                                            mip_map_reflect + mip_entries,
+                                           mip_map_refract ? mip_map_refract + mip_entries : nullptr,
                                            (mip_offset + index) * 4,
                                            mip_entries * 4,
                                            diffuse_weight,
-                                           reflect_weight);
+                                           reflect_weight,
+                                           refract_weight,
+                                           flip_refraction,
+                                           flip_reflection);
             }
             else
             {
@@ -1018,7 +1025,7 @@ void RadianceProxy::build(
     const float radiance_scale)
 {
     m_quadtree_nodes = quadtree_nodes;
-    m_quadtree_strata = std::make_shared<std::array<const QuadTreeNode *, PROXYWIDTH * PROXYWIDTH>>();
+    m_quadtree_strata = std::make_shared<std::array<const QuadTreeNode *, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH>>();
 
     size_t end_level = 0;
     size_t map_width = ProxyWidth;
@@ -1094,14 +1101,15 @@ float cos_theta_to_boundary(const Point2u &p, const Point2u &dest, const float P
 void RadianceProxy::build_product(
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
-    const Vector3f &shading_normal)
+    const Vector3f &shading_normal,
+    const float *diffuse_proxy_table,
+    const float *reflect_proxy_table)
 {
-// #ifdef BUILD_SIMD_PRODUCT
-//     build_product_simd(bsdf_proxy, outgoing, shading_normal);
-// #else
-//     build_product_scalar(bsdf_proxy, outgoing, shading_normal);
-// #endif
-    return;
+#ifdef BUILD_SIMD_PRODUCT
+    build_product_simd(bsdf_proxy, outgoing, shading_normal, diffuse_proxy_table, reflect_proxy_table);
+#else
+    build_product_scalar(bsdf_proxy, outgoing, shading_normal);
+#endif
 }
 
 void RadianceProxy::build_product_scalar(
@@ -1150,7 +1158,9 @@ void RadianceProxy::build_product_scalar(
 void RadianceProxy::build_product_simd(
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
-    const Vector3f &shading_normal)
+    const Vector3f &shading_normal,
+    const float *diffuse_proxy_table,
+    const float *reflect_proxy_table)
 {
     assert(m_is_built);
 
@@ -1168,39 +1178,44 @@ void RadianceProxy::build_product_simd(
     Vec8f distribution_sum_left(Zero_SIMD);
     Vec8f distribution_sum_right(Zero_SIMD);
 
-    Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
-    bsdf_proxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
+    Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refraction_lobe;
+    bsdf_proxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refraction_lobe);
 
-    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(ProxyWidth * PixelOutWidth);
-    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(ProxyWidth * PixelOutWidth);
+    const bool useRefraction = bsdf_proxy.m_is_refractive && !refraction_lobe.isZero();
+    const bool flipRefraction = !useRefraction ? false : dot(diffuse_lobe, refraction_lobe) > 0.0f;
+    const bool flipReflection = bsdf_proxy.m_is_refractive && dot(diffuse_lobe, reflectance_lobe) < 0.0f;
+
+    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(MipIndexWidth);
+    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(MipIndexWidth);
+    Point2f refraction_scaled = useRefraction ? (dirToCanonical(refraction_lobe) * static_cast<float>(MipIndexWidth)) : Point2(0.0f);
 
     Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
     Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
+    Point2u refraction_pixel(refraction_scaled.x, refraction_scaled.y);
 
-    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), ProxyWidth * PixelOutWidth - 1);
-    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), ProxyWidth * PixelOutWidth - 1);
-    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), ProxyWidth * PixelOutWidth - 1);
-    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), ProxyWidth * PixelOutWidth - 1);
+    const size_t MaxMipIndex = MipIndexWidth - 1;
 
-    const size_t diffuse_table_index = diffuse_pixel.y * ProxyWidth * PixelOutWidth + diffuse_pixel.x;
-    const float* diffuse_proxy = &(*proxy_table)[diffuse_table_index];
-    const float* reflectance_proxy;
+    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), MaxMipIndex);
+    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), MaxMipIndex);
+    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), MaxMipIndex);
+    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), MaxMipIndex);
+    refraction_pixel.x = std::min(static_cast<size_t>(refraction_pixel.x), MaxMipIndex);
+    refraction_pixel.y = std::min(static_cast<size_t>(refraction_pixel.y), MaxMipIndex);
+
+    const size_t ProductEntries = ProxyWidth * ProxyWidth;
+    const size_t diffuse_mip_index = (diffuse_pixel.y * MipIndexWidth + diffuse_pixel.x) * ProductEntries;
+
+    const size_t alpha_reflection_index = (bsdf_proxy.m_reflection_roughness) * alpha_steps;
+    const size_t alpha_refraction_index = std::min((size_t)(bsdf_proxy.m_refraction_roughness * alpha_steps), alpha_steps - 1);
+
+    const size_t reflect_mip_index = alpha_reflection_index * MipIndexWidth2 * ProductEntries +
+                        (reflectance_pixel.y * MipIndexWidth + reflectance_pixel.x) * ProductEntries;
+    const size_t refract_mip_index = alpha_refraction_index * MipIndexWidth2 * ProductEntries +
+                        (refraction_pixel.y * MipIndexWidth + refraction_pixel.x) * ProductEntries;
 
     Vec8f diffuse_weight(bsdf_proxy.m_diffuse_weight);
-    Vec8f reflectance_weight(bsdf_proxy.m_reflection_weight);
-
-    if (bsdf_proxy.m_is_reflective)
-    {
-        const size_t alpha_index = (bsdf_proxy.m_reflection_roughness * 0.5f) * alpha_steps;
-        size_t reflectance_table_index = alpha_steps * ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth; // jump over diffuse table
-        reflectance_table_index += alpha_index * ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * PixelOutWidth * PixelOutWidth; // jump over reflectance alpha
-        reflectance_table_index += (reflectance_pixel.y * ProxyWidth * PixelOutWidth + reflectance_pixel.x) * ProxyWidth * ProxyWidth;
-        reflectance_proxy = &(*proxy_table)[reflectance_table_index];
-    }
-    else
-    {
-        reflectance_proxy = &zero_reflectance[0];
-    }
+    Vec8f reflection_weight(bsdf_proxy.m_reflection_weight);
+    Vec8f refraction_weight(bsdf_proxy.m_reflection_weight);
 
     for (size_t y = 0; y < ProxyWidth; ++y)
     {
@@ -1212,25 +1227,22 @@ void RadianceProxy::build_product_simd(
 
             const size_t index = y * ProxyWidth + x;
 
+            Vec8f diffuse_val, reflection_val, refraction_val;
+            diffuse_val.load(diffuse_proxy_table + diffuse_mip_index + index);
+            reflection_val.load(reflect_proxy_table + reflect_mip_index + index);
+            reflection_val = flipReflection ? select(diffuse_val == Zero_SIMD, reflection_val, Zero_SIMD) : select(diffuse_val > Zero_SIMD, reflection_val, Zero_SIMD);
 
-#ifdef LOAD_INCOMING_ARRAY
-            // const Vec8f &incoming_x = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3));
-            // const Vec8f &incoming_y = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3 + 8));
-            // const Vec8f &incoming_z = *reinterpret_cast<const Vec8f*>(worldDir_soa + (index * 3 + 2 * 8));
-            // incoming_x.load_a(worldDir_soa + (index * 3));
-            // incoming_y.load_a(worldDir_soa + (index * 3 + 8));
-            // incoming_z.load_a(worldDir_soa + (index * 3 + 2 * 8));
-#else
-            const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
-            const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
-            canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
-#endif
-            Vec8f diffuse_proxy_val, reflectance_proxy_val;
-            diffuse_proxy_val.load(&diffuse_proxy[index]);
-            reflectance_proxy_val.load(&reflectance_proxy[index]);
+            if (useRefraction)
+            {
+                refraction_val.load(reflect_proxy_table + refract_mip_index + index);
+                refraction_val = flipRefraction ? select(diffuse_val > Zero_SIMD, refraction_val, Zero_SIMD) : select(diffuse_val == Zero_SIMD, refraction_val, Zero_SIMD);
+            }
+            else
+            {
+                refraction_val = Zero_SIMD;
+            }
 
-            auto mask = diffuse_proxy_val > Zero_SIMD;
-            const Vec8f bsdf_proxy_value = diffuse_weight * diffuse_proxy_val + reflectance_weight * select(mask, reflectance_proxy_val, Zero_SIMD);
+            const Vec8f bsdf_proxy_value = diffuse_weight * diffuse_val + reflection_weight * reflection_val + refraction_weight * refraction_val;
             Vec8f radiance;
             radiance.load(&((*m_parent_map)[index]));
             radiance *= bsdf_proxy_value;
@@ -1248,39 +1260,6 @@ void RadianceProxy::build_product_simd(
             }
         }
     }
-
-    // float cosines[ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth];
-
-    // for (size_t dest_y = 0; dest_y < ProxyWidth; ++dest_y)
-    // {
-    //     for (size_t dest_x = 0; dest_x < ProxyWidth; ++dest_x)
-    //     {
-    //         const Point2u dest_pixel(dest_x, dest_y);
-    //         size_t dest_index = dest_y * ProxyWidth + dest_x;
-
-    //         for (size_t y = 0; y < ProxyWidth; ++y)
-    //         {
-    //             for (size_t x = 0; x < ProxyWidth; ++x)
-    //             {
-    //                 const Point2u incoming_pixel(x, y);
-    //                 size_t index = y * ProxyWidth + x;
-
-    //                 const float cos_theta = cos_theta_to_boundary(incoming_pixel, dest_pixel, ProxyWidth);
-    //                 cosines[dest_index * ProxyWidth * ProxyWidth + index] = cos_theta;
-
-    //                 if (cos_theta > M_PI / 4.0f && cos_theta != 1.0f)
-    //                 {
-    //                     const float cos_theta_2 = cos_theta_to_boundary(incoming_pixel, dest_pixel, ProxyWidth);
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
-
-    // const char* data = reinterpret_cast<const char*>(cosines);
-    // std::ofstream file("/mnt/Data/_Programming/PracticalPathGuiding/cosines.bin", std::ios::out | std::ios::binary);
-    // file.write(data, ProxyWidth * ProxyWidth * ProxyWidth * ProxyWidth * sizeof(float));
-    // file.close();
 
     m_image_importance_sampler.build();
 }
@@ -1492,13 +1471,13 @@ public:
         return m_nodes[0].pdf(p, m_nodes) / (4 * M_PI);
     }
 
-    Float pdf_product(Point2 p, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
+    Float pdf_product(Point2 p, const float *const mip_map_diffuse, const float *const mip_map_reflect, const float *const mip_map_refract, const size_t mip_offset, const size_t mip_entries, const Vec4f &diffuse_weight, const Vec4f &reflect_weight, const Vec4f &refract_weight, const bool flip_refraction, const bool flip_reflection) const
     {
         if (!(mean() > 0)) {
             return 1 / (4 * M_PI);
         }
 
-        return m_nodes[0].pdf_product(p, m_nodes, mip_map_diffuse, mip_map_reflect, mip_offset, mip_entries, diffuse_weight, reflect_weight) / (4 * M_PI);
+        return m_nodes[0].pdf_product(p, m_nodes, mip_map_diffuse, mip_map_reflect, mip_map_refract, mip_offset, mip_entries, diffuse_weight, reflect_weight, refract_weight, flip_refraction, flip_reflection) / (4 * M_PI);
     }
 
     int depthAt(Point2 p) const {
@@ -1522,13 +1501,13 @@ public:
         return res;
     }
 
-    Point2 sample_product(Sampler *sampler, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
+    Point2 sample_product(Sampler *sampler, const float *const mip_map_diffuse, const float *const mip_map_reflect, const float *const mip_map_refract, const size_t mip_offset, const size_t mip_entries, const Vec4f &diffuse_weight, const Vec4f &reflect_weight, const Vec4f &refract_weight, const bool flip_refraction, const bool flip_reflection) const
     {
         if (!(mean() > 0)) {
             return sampler->next2D();
         }
 
-        Point2 res = m_nodes[0].sample_product(sampler, m_nodes, mip_map_diffuse, mip_map_reflect, mip_offset, mip_entries, diffuse_weight, reflect_weight);
+        Point2 res = m_nodes[0].sample_product(sampler, m_nodes, mip_map_diffuse, mip_map_reflect, mip_map_refract, mip_offset, mip_entries, diffuse_weight, reflect_weight, refract_weight, flip_refraction, flip_reflection);
 
         res.x = math::clamp(res.x, 0.0f, 1.0f);
         res.y = math::clamp(res.y, 0.0f, 1.0f);
@@ -1790,18 +1769,18 @@ public:
         return canonicalToDir(sampling.sample(sampler));
     }
 
-    Vector sample_product(Sampler *sampler, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
+    Vector sample_product(Sampler *sampler, const float *const mip_map_diffuse, const float *const mip_map_reflect, const float *const mip_map_refract, const size_t mip_offset, const size_t mip_entries, const Vec4f &diffuse_weight, const Vec4f &reflect_weight, const Vec4f &refract_weight, const bool flip_refraction, const bool flip_reflection) const
     {
-        return canonicalToDir(sampling.sample_product(sampler, mip_map_diffuse, mip_map_reflect, mip_offset, mip_entries, diffuse_weight, reflect_weight));
+        return canonicalToDir(sampling.sample_product(sampler, mip_map_diffuse, mip_map_reflect, mip_map_refract, mip_offset, mip_entries, diffuse_weight, reflect_weight, refract_weight, flip_refraction, flip_reflection));
     }
 
     Float pdf(const Vector& dir) const {
         return sampling.pdf(dirToCanonical(dir));
     }
 
-    Float pdf_product(const Vector &dir, const float *const mip_map_diffuse, const float *const mip_map_reflect, const size_t mip_offset, const size_t mip_entries, const Vec4f& diffuse_weight, const Vec4f& reflect_weight) const
+    Float pdf_product(const Vector &dir, const float *const mip_map_diffuse, const float *const mip_map_reflect, const float *const mip_map_refract, const size_t mip_offset, const size_t mip_entries, const Vec4f &diffuse_weight, const Vec4f &reflect_weight, const Vec4f &refract_weight, const bool flip_refraction, const bool flip_reflection) const
     {
-        return sampling.pdf_product(dirToCanonical(dir), mip_map_diffuse, mip_map_reflect, mip_offset, mip_entries, diffuse_weight, reflect_weight);
+        return sampling.pdf_product(dirToCanonical(dir), mip_map_diffuse, mip_map_reflect, mip_map_refract, mip_offset, mip_entries, diffuse_weight, reflect_weight, refract_weight, flip_refraction, flip_reflection);
     }
 
     Float diff(const DTreeWrapper& other) const {
@@ -2119,7 +2098,7 @@ public:
         const size_t array_size_diffuse = PROXYWIDTH * PROXYWIDTH * PixelOutWidth * PixelOutWidth * m_mip_entries;
         const size_t array_size_reflect = array_size_diffuse * alpha_steps;
 
-        std::ifstream file_diffuse("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_mips_diffuse.bin", std::ios::in | std::ios::binary);
+        std::ifstream file_diffuse("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_mips_diffuse_final.bin", std::ios::in | std::ios::binary);
 
         if (file_diffuse.is_open())
         {
@@ -2128,13 +2107,34 @@ public:
             file_diffuse.read((char*) m_proxy_table_diffuse.data(), array_size_diffuse * sizeof(float));
         }
 
-        std::ifstream file_reflect("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_mips_reflect.bin", std::ios::in | std::ios::binary);
+        std::ifstream file_reflect("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_mips_reflect_final.bin", std::ios::in | std::ios::binary);
 
         if (file_reflect.is_open())
         {
             // Storage for reflect and reflectance tables
             m_proxy_table_reflect.reserve(array_size_reflect);
             file_reflect.read((char*) m_proxy_table_reflect.data(), array_size_reflect * sizeof(float));
+        }
+
+        const size_t array_size_diffuse_linear = PROXYWIDTH * PROXYWIDTH * PixelOutWidth * PixelOutWidth * PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH;
+        const size_t array_size_reflect_linear = array_size_diffuse_linear * alpha_steps;
+
+        std::ifstream file_diffuse_linear("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_mips_diffuse_linear_final.bin", std::ios::in | std::ios::binary);
+
+        if (file_diffuse_linear.is_open())
+        {
+            // Storage for diffuse and reflectance tables
+            m_proxy_table_diffuse_linear.reserve(array_size_diffuse_linear);
+            file_diffuse_linear.read((char*) m_proxy_table_diffuse_linear.data(), array_size_diffuse_linear * sizeof(float));
+        }
+
+        std::ifstream file_reflect_linear("/mnt/Data/_Programming/PracticalPathGuiding/proxy_table_mips_reflect_linear_final.bin", std::ios::in | std::ios::binary);
+
+        if (file_reflect_linear.is_open())
+        {
+            // Storage for reflect and reflectance tables
+            m_proxy_table_reflect_linear.reserve(array_size_reflect_linear);
+            file_reflect_linear.read((char*) m_proxy_table_reflect_linear.data(), array_size_reflect_linear * sizeof(float));
         }
     }
 
@@ -2290,6 +2290,16 @@ public:
         return m_proxy_table_reflect.data();
     }
 
+    const float* get_proxy_table_diffuse_linear() const
+    {
+        return m_proxy_table_diffuse_linear.data();
+    }
+
+    const float* get_proxy_table_reflect_linear() const
+    {
+        return m_proxy_table_reflect_linear.data();
+    }
+
     const size_t get_mip_entries() const
     {
         return m_mip_entries;
@@ -2300,6 +2310,8 @@ private:
     AABB m_aabb;
     std::vector<float> m_proxy_table_diffuse;
     std::vector<float> m_proxy_table_reflect;
+    std::vector<float> m_proxy_table_diffuse_linear;
+    std::vector<float> m_proxy_table_reflect_linear;
     size_t m_mip_entries;
 };
 
@@ -2383,6 +2395,7 @@ public:
 
         m_useRR = props.getBoolean("useADRR", true);
         m_maxProductAwareBounces = props.getInteger("maxProductAwareBounces", -1);
+        m_useHierarchicalProduct = props.getBoolean("useHierarchicalProduct", true);
     }
 
     ref<BlockedRenderProcess> renderPass(Scene *scene,
@@ -2948,7 +2961,21 @@ public:
         }
     }
 
-    void setGuidingMode(const BSDF *bsdf, const BSDFSamplingRecord &bRec, RadianceProxy &radianceProxy, BSDFProxy& bsdfProxy, const DTreeWrapper *dTree, Float &bsdfSamplingFraction, Float &productSamplingFraction, EGuidingMode &guidingMode, EGuidingMode& bounceMode, int& maxProductAwareBounces) const
+    void setGuidingMode(
+
+        const BSDF *bsdf,
+        const BSDFSamplingRecord &bRec,
+        RadianceProxy &radianceProxy,
+        BSDFProxy& bsdfProxy,
+        const DTreeWrapper *dTree,
+        Float &bsdfSamplingFraction,
+        Float &productSamplingFraction,
+        EGuidingMode &guidingMode,
+        EGuidingMode& bounceMode,
+        int& maxProductAwareBounces,
+        const bool useHierarchicalProduct,
+        const float* diffuse_proxy_table,
+        const float* reflect_proxy_table) const
     {
         auto type = bsdf->getType();
         const bool canUseGuiding = m_isBuilt && dTree && (type & BSDF::EDelta) != (type & BSDF::EAll);
@@ -2975,8 +3002,11 @@ public:
 
                     if (useProductGuiding)
                     {
-                        // radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal);
-                        bsdfProxy.finish_parameterization(wiWorld, proxyNormal);
+                        if (useHierarchicalProduct)
+                            bsdfProxy.finish_parameterization(wiWorld, proxyNormal);
+                        else
+                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table);
+
                         bsdfSamplingFraction = m_bsdfSamplingFraction;
                         productSamplingFraction = 1.0f;
                     }
@@ -3004,8 +3034,11 @@ public:
 
                     if (useProductGuiding)
                     {
-                        // radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal);
-                        bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), proxyNormal);
+                        if (useHierarchicalProduct)
+                            bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), proxyNormal);
+                        else
+                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table);
+
                         --maxProductAwareBounces;
                     }
                     else // Path guiding
@@ -3064,7 +3097,8 @@ public:
         const DTreeWrapper* dTree,
         const float* const mip_map_diffuse,
         const float* const mip_map_reflect,
-        const size_t mip_entries) const{
+        const size_t mip_entries,
+        const bool useHierarchicalProduct) const{
         Point2 sample = rRec.nextSample2D();
 
         // auto type = bsdf->getType();
@@ -3076,7 +3110,10 @@ public:
         // }
 
         bool sampledProduct = false;
-        size_t diffuse_mip_index, reflect_mip_index;
+        bool useRefraction;
+        bool flipRefraction;
+        bool flipReflection;
+        size_t diffuse_mip_index, reflect_mip_index, refract_mip_index;
 
         Spectrum result;
         if (sample.x < bsdfSamplingFraction) {
@@ -3100,30 +3137,50 @@ public:
             // Product guiding
             if (sample.y < productSamplingFraction)
             {
-                Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
-                bsdfProxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
+                if (useHierarchicalProduct)
+                {
+                    Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refraction_lobe;
+                    bsdfProxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refraction_lobe);
 
-                Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(MipIndexWidth);
-                Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(MipIndexWidth);
+                    useRefraction = bsdfProxy.m_is_refractive && !refraction_lobe.isZero();
+                    flipRefraction = !useRefraction ? false : dot(diffuse_lobe, refraction_lobe) > 0.0f;
+                    flipReflection = bsdfProxy.m_is_refractive && dot(diffuse_lobe, reflectance_lobe) < 0.0f;
 
-                Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
-                Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
+                    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(MipIndexWidth);
+                    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(MipIndexWidth);
+                    Point2f refraction_scaled = useRefraction ? (dirToCanonical(refraction_lobe) * static_cast<float>(MipIndexWidth)) : Point2(0.0f);
 
-                const size_t MaxMipIndex = MipIndexWidth - 1;
+                    Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
+                    Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
+                    Point2u refraction_pixel(refraction_scaled.x, refraction_scaled.y);
 
-                diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), MaxMipIndex);
-                diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), MaxMipIndex);
-                reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), MaxMipIndex);
-                reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), MaxMipIndex);
+                    const size_t MaxMipIndex = MipIndexWidth - 1;
 
-                diffuse_mip_index = (diffuse_pixel.y * MipIndexWidth + diffuse_pixel.x) * mip_entries;
+                    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), MaxMipIndex);
+                    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), MaxMipIndex);
+                    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), MaxMipIndex);
+                    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), MaxMipIndex);
+                    refraction_pixel.x = std::min(static_cast<size_t>(refraction_pixel.x), MaxMipIndex);
+                    refraction_pixel.y = std::min(static_cast<size_t>(refraction_pixel.y), MaxMipIndex);
 
-                const size_t alpha_index = (bsdfProxy.m_reflection_roughness * 0.5f) * alpha_steps;
-                reflect_mip_index = alpha_index * MipIndexWidth2 * mip_entries +
-                                                    (reflectance_pixel.y * MipIndexWidth + reflectance_pixel.x) * mip_entries;
+                    diffuse_mip_index = (diffuse_pixel.y * MipIndexWidth + diffuse_pixel.x) * mip_entries;
 
-                bRec.wo = bRec.its.toLocal(dTree->sample_product(rRec.sampler, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight));
-                sampledProduct = true;
+                    const size_t alpha_reflection_index = (bsdfProxy.m_reflection_roughness) * alpha_steps;
+                    const size_t alpha_refraction_index = std::min((size_t)(bsdfProxy.m_refraction_roughness * alpha_steps), alpha_steps - 1);
+
+                    reflect_mip_index = alpha_reflection_index * MipIndexWidth2 * mip_entries +
+                                        (reflectance_pixel.y * MipIndexWidth + reflectance_pixel.x) * mip_entries;
+                    refract_mip_index = alpha_refraction_index * MipIndexWidth2 * mip_entries +
+                                        (refraction_pixel.y * MipIndexWidth + refraction_pixel.x) * mip_entries;
+
+                    bRec.wo = bRec.its.toLocal(dTree->sample_product(rRec.sampler, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, useRefraction ? mip_map_reflect + refract_mip_index : nullptr, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight, bsdfProxy.m_refraction_weight, flipRefraction, flipReflection));
+                    sampledProduct = true;
+                }
+                else {
+                    Vector dir;
+                    radianceProxy.sample(rRec.sampler, dir);
+                    bRec.wo = bRec.its.toLocal(dir);
+                }
             }
             // else D-Tree guiding
             else
@@ -3133,7 +3190,7 @@ public:
             result = bsdf->eval(bRec);
         }
 
-        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bsdfProxy, mip_map_diffuse, mip_map_reflect, mip_entries, bRec, dTree, sampledProduct, diffuse_mip_index, reflect_mip_index);
+        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bsdfProxy, mip_map_diffuse, mip_map_reflect, mip_entries, bRec, dTree, useHierarchicalProduct, sampledProduct, diffuse_mip_index, reflect_mip_index, refract_mip_index, useRefraction, flipRefraction, flipReflection);
         if (woPdf == 0) {
             return Spectrum{0.0f};
         }
@@ -3141,8 +3198,8 @@ public:
         return result / woPdf;
     }
 
-    void pdfMat(Float &woPdf, Float &bsdfPdf, Float &dTreePdf, Float &productPdf, Float bsdfSamplingFraction, Float productSamplingFraction, const BSDF *bsdf, const RadianceProxy &radianceProxy, const BSDFProxy& bsdfProxy, const float* const mip_map_diffuse, const float* mip_map_reflect,
-        const size_t mip_entries, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree, const bool sampledProduct = false, const size_t diffuse_mip_index = 0, const size_t reflect_mip_index = 0) const
+    void pdfMat(Float &woPdf, Float &bsdfPdf, Float &dTreePdf, Float &productPdf, Float bsdfSamplingFraction, Float productSamplingFraction, const BSDF *bsdf, const RadianceProxy &radianceProxy, const BSDFProxy &bsdfProxy, const float *const mip_map_diffuse, const float *mip_map_reflect,
+                const size_t mip_entries, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree, const bool useHierarchicalProduct, const bool sampledProduct = false, const size_t diffuse_mip_index = 0, const size_t reflect_mip_index = 0, const size_t refract_mip_index = 0, const bool useRefraction = false, const bool flipRefraction = false, const bool flipReflection = false) const
     {
         productPdf = dTreePdf = 0;
 
@@ -3168,35 +3225,53 @@ public:
         }
         else
         {
-            if (!sampledProduct)
+            if (useHierarchicalProduct)
             {
-                Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe;
-                bsdfProxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refractance_lobe);
+                if (!sampledProduct)
+                {
+                    Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refraction_lobe;
+                    bsdfProxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refraction_lobe);
 
-                Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(MipIndexWidth);
-                Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(MipIndexWidth);
+                    const bool useRefraction = bsdfProxy.m_is_refractive && !refraction_lobe.isZero();
+                    const bool flipRefraction = !useRefraction ? false : dot(diffuse_lobe, refraction_lobe) > 0.0f;
+                    const bool flipReflection = bsdfProxy.m_is_refractive && dot(diffuse_lobe, reflectance_lobe) < 0.0f;
 
-                Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
-                Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
+                    Point2f diffuse_scaled = dirToCanonical(diffuse_lobe) * static_cast<float>(MipIndexWidth);
+                    Point2f reflectance_scaled = dirToCanonical(reflectance_lobe) * static_cast<float>(MipIndexWidth);
+                    Point2f refraction_scaled = useRefraction ? (dirToCanonical(refraction_lobe) * static_cast<float>(MipIndexWidth)) : Point2(0.0f);
 
-                const size_t MaxMipIndex = MipIndexWidth - 1;
+                    Point2u diffuse_pixel(diffuse_scaled.x, diffuse_scaled.y);
+                    Point2u reflectance_pixel(reflectance_scaled.x, reflectance_scaled.y);
+                    Point2u refraction_pixel(refraction_pixel.x, refraction_pixel.y);
 
-                diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), MaxMipIndex);
-                diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), MaxMipIndex);
-                reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), MaxMipIndex);
-                reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), MaxMipIndex);
+                    const size_t MaxMipIndex = MipIndexWidth - 1;
 
-                const size_t diffuse_mip_index = (diffuse_pixel.y * MipIndexWidth + diffuse_pixel.x) * mip_entries;
+                    diffuse_pixel.x = std::min(static_cast<size_t>(diffuse_pixel.x), MaxMipIndex);
+                    diffuse_pixel.y = std::min(static_cast<size_t>(diffuse_pixel.y), MaxMipIndex);
+                    reflectance_pixel.x = std::min(static_cast<size_t>(reflectance_pixel.x), MaxMipIndex);
+                    reflectance_pixel.y = std::min(static_cast<size_t>(reflectance_pixel.y), MaxMipIndex);
+                    refraction_pixel.x = std::min(static_cast<size_t>(refraction_pixel.x), MaxMipIndex);
+                    refraction_pixel.y = std::min(static_cast<size_t>(refraction_pixel.y), MaxMipIndex);
 
-                const size_t alpha_index = (bsdfProxy.m_reflection_roughness * 0.5f) * alpha_steps;
-                const size_t reflect_mip_index = alpha_index * MipIndexWidth2 * mip_entries +
-                                                (reflectance_pixel.y * MipIndexWidth + reflectance_pixel.x) * mip_entries;
+                    const size_t diffuse_mip_index = (diffuse_pixel.y * MipIndexWidth + diffuse_pixel.x) * mip_entries;
 
-                productPdf = dTree->pdf_product(dir, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight);
+                    const size_t alpha_reflection_index = (bsdfProxy.m_reflection_roughness) * alpha_steps;
+                    const size_t alpha_refraction_index = std::min((size_t)(bsdfProxy.m_refraction_roughness * alpha_steps), alpha_steps - 1);
+                    const size_t reflect_mip_index = alpha_reflection_index * MipIndexWidth2 * mip_entries +
+                                                    (reflectance_pixel.y * MipIndexWidth + reflectance_pixel.x) * mip_entries;
+                    const size_t refract_mip_index = alpha_refraction_index * MipIndexWidth2 * mip_entries +
+                                                    (refraction_pixel.y * MipIndexWidth + refraction_pixel.x) * mip_entries;
+
+                    productPdf = dTree->pdf_product(dir, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, useRefraction ? mip_map_reflect + refract_mip_index : nullptr, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight, bsdfProxy.m_refraction_weight, flipRefraction, flipReflection);
+                }
+                else
+                {
+                    productPdf = dTree->pdf_product(dir, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, useRefraction ? mip_map_reflect + refract_mip_index : nullptr, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight, bsdfProxy.m_refraction_weight, flipRefraction, flipReflection);
+                }
             }
             else
             {
-                productPdf = dTree->pdf_product(dir, mip_map_diffuse + diffuse_mip_index, mip_map_reflect + reflect_mip_index, 0, 4, bsdfProxy.m_diffuse_weight, bsdfProxy.m_reflection_weight);
+                productPdf = radianceProxy.pdf(dir);
             }
         }
             
@@ -3475,9 +3550,38 @@ public:
                     radianceProxy.set_maps(dTree->getRadianceProxy());
                 }
 
-                setGuidingMode(bsdf, bRec, radianceProxy, bsdfProxy, dTree, bsdfSamplingFraction, productSamplingFraction, guidingMode, bounceMode, maxProductAwareBounces);
+                setGuidingMode(
+                    bsdf,
+                    bRec,
+                    radianceProxy,
+                    bsdfProxy,
+                    dTree,
+                    bsdfSamplingFraction,
+                    productSamplingFraction,
+                    guidingMode,
+                    bounceMode,
+                    maxProductAwareBounces,
+                    m_useHierarchicalProduct,
+                    m_sdTree->get_proxy_table_diffuse_linear(),
+                    m_sdTree->get_proxy_table_reflect_linear());
 
-                Spectrum bsdfWeight = sampleMat(bsdf, radianceProxy, bsdfProxy, bRec, woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, rRec, dTree, m_sdTree->get_proxy_table_diffuse(), m_sdTree->get_proxy_table_reflect(), m_sdTree->get_mip_entries());
+                Spectrum bsdfWeight = sampleMat(
+                    bsdf,
+                    radianceProxy,
+                    bsdfProxy,
+                    bRec,
+                    woPdf,
+                    bsdfPdf,
+                    dTreePdf,
+                    productPdf,
+                    bsdfSamplingFraction,
+                    productSamplingFraction,
+                    rRec,
+                    dTree,
+                    m_sdTree->get_proxy_table_diffuse(),
+                    m_sdTree->get_proxy_table_reflect(),
+                    m_sdTree->get_mip_entries(),
+                    m_useHierarchicalProduct);
 
                 // Visualize RadianceProxy
                 // if (m_isFinalIter && dTree)
@@ -3575,7 +3679,8 @@ public:
                                     m_sdTree->get_proxy_table_reflect(),
                                     m_sdTree->get_mip_entries(),
                                     bRec,
-                                    dTree);
+                                    dTree,
+                                    m_useHierarchicalProduct);
                             }
 
                             /* Weight using the power heuristic */
@@ -4054,6 +4159,7 @@ private:
 
     EGuidingMode m_guidingMode = EGuidingMode::EProduct;
     int m_maxProductAwareBounces;
+    bool m_useHierarchicalProduct;
 
 public:
     MTS_DECLARE_CLASS()

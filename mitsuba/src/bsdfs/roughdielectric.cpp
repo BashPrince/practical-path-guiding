@@ -646,14 +646,16 @@ public:
 	bool add_parameters_to_proxy(BSDFProxy &bsdf_proxy,
 		const BSDFSamplingRecord &bRec, bool& flipNormal) const override
 	{
-		return false;
+		// return false;
 		flipNormal = false;
 		const float alpha = std::max(m_alphaU->eval(bRec.its).average(), m_alphaV->eval(bRec.its).average());
+		float cosThetaT;
+		float F = fresnelDielectricExt(Frame::cosTheta(bRec.wi), cosThetaT, m_eta);
 		const float avg_specular_reflectance = m_specularReflectance->eval(bRec.its).average();
 		const float avg_specular_transmittance = m_specularTransmittance->eval(bRec.its).average();
-		bsdf_proxy.add_reflection_weight(avg_specular_reflectance, alpha);
-		bsdf_proxy.add_refraction_weight(avg_specular_transmittance, alpha, m_eta);
-
+		bsdf_proxy.add_reflection_weight(avg_specular_reflectance * F, alpha);
+		bsdf_proxy.add_refraction_weight(avg_specular_transmittance * (1.0f - F), alpha, m_eta);
+		return true;
 	}
 
 	std::string toString() const {
