@@ -279,9 +279,6 @@
 	  Product sampling method. Use "hierarchical" for product sample warping, "table" for building a distribution
 	  using a precalculated bsdf proxy table, or "proxy" for building a distribution with bsdf proxy evaluations.
     </param>
-	<param name="useProxyTable" readableName="Use precalculated proxy table" type="boolean" default="true" importance="1">
-	  Use a precalculated proxy table when using the slower distribution building method.
-    </param>
 	</plugin>
 
 	<plugin type="integrator" name="adaptive" readableName="Adaptive integrator"
