@@ -275,8 +275,12 @@
 	<param name="maxProductAwareBounces" readableName="Max product bounces" type="integer" default="-1" importance="1">
 	  Limit the maximum number of possible product guiding bounces.
     </param>
-	<param name="useHierarchicalProduct" readableName="Use hierarchical product sampling" type="boolean" default="true" importance="1">
-	  Use hierarchical sample warping for sampling the product or slower distribution building method.
+	<param name="productSamplingMethod" readableName="Product sampling method" type="string" default="hierarchical" importance="1">
+	  Product sampling method. Use "hierarchical" for product sample warping, "table" for building a distribution
+	  using a precalculated bsdf proxy table, or "proxy" for building a distribution with bsdf proxy evaluations.
+    </param>
+	<param name="useProxyTable" readableName="Use precalculated proxy table" type="boolean" default="true" importance="1">
+	  Use a precalculated proxy table when using the slower distribution building method.
     </param>
 	</plugin>
 

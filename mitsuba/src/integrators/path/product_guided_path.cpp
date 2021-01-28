@@ -41,17 +41,6 @@
 #define BUILD_SIMD_PRODUCT
 #define PROXYWIDTH 32
 #define PRODUCTPROXYWIDTH 16
-// #define LOAD_INCOMING_ARRAY
-
-#ifdef LOAD_INCOMING_ARRAY
-#if PROXYWIDTH == 32
-    #include <mitsuba/productguiding/proxyarrays_16.h>
-#elif PROXYWIDTH == 8
-    #include <mitsuba/productguiding/proxyarrays_8.h>
-#else
-    #error(ProxyWidth neither 8 nor 16)
-#endif
-#endif
 
 const size_t PixelOutWidth = 2;
 const size_t alpha_steps = 50;
@@ -396,7 +385,8 @@ public:
         const Vector3f &outgoing,
         const Vector3f &shading_normal,
         const float* diffuse_proxy_table,
-        const float* reflect_proxy_table);
+        const float* reflect_proxy_table,
+        const bool useProxyTable);
 
     void build_product_scalar(
         BSDFProxy &bsdf_proxy,
@@ -409,6 +399,11 @@ public:
         const Vector3f &shading_normal,
         const float *diffuse_proxy_table,
         const float *reflect_proxy_table);
+
+    void build_product_simd(
+        BSDFProxy &bsdf_proxy,
+        const Vector3f &outgoing,
+        const Vector3f &shading_normal);
 
     void clear();
 
@@ -1103,10 +1098,14 @@ void RadianceProxy::build_product(
     const Vector3f &outgoing,
     const Vector3f &shading_normal,
     const float *diffuse_proxy_table,
-    const float *reflect_proxy_table)
+    const float *reflect_proxy_table,
+    const bool useProxyTable)
 {
 #ifdef BUILD_SIMD_PRODUCT
-    build_product_simd(bsdf_proxy, outgoing, shading_normal, diffuse_proxy_table, reflect_proxy_table);
+    if (useProxyTable)
+        build_product_simd(bsdf_proxy, outgoing, shading_normal, diffuse_proxy_table, reflect_proxy_table);
+    else
+        build_product_simd(bsdf_proxy, outgoing, shading_normal);
 #else
     build_product_scalar(bsdf_proxy, outgoing, shading_normal);
 #endif
@@ -1243,6 +1242,64 @@ void RadianceProxy::build_product_simd(
             }
 
             const Vec8f bsdf_proxy_value = diffuse_weight * diffuse_val + reflection_weight * reflection_val + refraction_weight * refraction_val;
+            Vec8f radiance;
+            radiance.load(&((*m_parent_map)[index]));
+            radiance *= bsdf_proxy_value;
+            radiance.store(&m_map[index]);
+
+            if (x == 0)
+            {
+                distribution_sum_left += select(radiance > Zero_SIMD, radiance, Zero_SIMD);
+                distribution_sum_left.store(&distribution[index]);
+            }
+            else
+            {
+                distribution_sum_right += select(radiance > Zero_SIMD, radiance, Zero_SIMD);
+                distribution_sum_right.store(&distribution[index]);
+            }
+        }
+    }
+
+    m_image_importance_sampler.build();
+}
+
+void RadianceProxy::build_product_simd(
+    BSDFProxy &bsdf_proxy,
+    const Vector3f &outgoing,
+    const Vector3f &shading_normal)
+{
+    assert(m_is_built);
+
+    if (m_product_is_built)
+        return;
+
+    bsdf_proxy.finish_parameterization(outgoing, shading_normal);
+    m_product_is_built = true;
+
+    const Vec8f inv_width(1.0f / ProxyWidth);
+    const Vec8i simd_loop_offsets(0, 1, 2, 3, 4, 5, 6, 7);
+
+    float* distribution = m_image_importance_sampler.get_distribution();
+
+    Vec8f distribution_sum_left(Zero_SIMD);
+    Vec8f distribution_sum_right(Zero_SIMD);
+
+    for (size_t y = 0; y < ProxyWidth; ++y)
+    {
+        const Vec8i pixel_y(y);
+
+        for (size_t x = 0; x < ProxyWidth; x += 8)
+        {
+            const Vec8i pixel_x = Vec8i(x) + simd_loop_offsets;
+
+            const size_t index = y * ProxyWidth + x;
+
+            Vec8f incoming_x, incoming_y, incoming_z;
+            const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
+            const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
+            canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
+
+            const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z);
             Vec8f radiance;
             radiance.load(&((*m_parent_map)[index]));
             radiance *= bsdf_proxy_value;
@@ -2395,7 +2452,22 @@ public:
 
         m_useRR = props.getBoolean("useADRR", true);
         m_maxProductAwareBounces = props.getInteger("maxProductAwareBounces", -1);
-        m_useHierarchicalProduct = props.getBoolean("useHierarchicalProduct", true);
+
+        const std::string productMethod = props.getString("productSamplingMethod", "hierarchical");
+
+        if (productMethod == "hierarchical") {
+            m_useHierarchicalProduct = true;
+        }
+        else {
+            m_useHierarchicalProduct = false;
+
+            if (productMethod == "table") {
+                m_useProxyTable = true;
+            }
+            else {
+                m_useProxyTable = false;
+            }
+        }
     }
 
     ref<BlockedRenderProcess> renderPass(Scene *scene,
@@ -2975,7 +3047,8 @@ public:
         int& maxProductAwareBounces,
         const bool useHierarchicalProduct,
         const float* diffuse_proxy_table,
-        const float* reflect_proxy_table) const
+        const float* reflect_proxy_table,
+        const bool useProxyTable) const
     {
         auto type = bsdf->getType();
         const bool canUseGuiding = m_isBuilt && dTree && (type & BSDF::EDelta) != (type & BSDF::EAll);
@@ -3005,7 +3078,7 @@ public:
                         if (useHierarchicalProduct)
                             bsdfProxy.finish_parameterization(wiWorld, proxyNormal);
                         else
-                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table);
+                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, useProxyTable);
 
                         bsdfSamplingFraction = m_bsdfSamplingFraction;
                         productSamplingFraction = 1.0f;
@@ -3037,7 +3110,7 @@ public:
                         if (useHierarchicalProduct)
                             bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), proxyNormal);
                         else
-                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table);
+                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, useProxyTable);
 
                         --maxProductAwareBounces;
                     }
@@ -3563,7 +3636,8 @@ public:
                     maxProductAwareBounces,
                     m_useHierarchicalProduct,
                     m_sdTree->get_proxy_table_diffuse_linear(),
-                    m_sdTree->get_proxy_table_reflect_linear());
+                    m_sdTree->get_proxy_table_reflect_linear(),
+                    m_useProxyTable);
 
                 Spectrum bsdfWeight = sampleMat(
                     bsdf,
@@ -4160,6 +4234,7 @@ private:
     EGuidingMode m_guidingMode = EGuidingMode::EProduct;
     int m_maxProductAwareBounces;
     bool m_useHierarchicalProduct;
+    bool m_useProxyTable;
 
 public:
     MTS_DECLARE_CLASS()
