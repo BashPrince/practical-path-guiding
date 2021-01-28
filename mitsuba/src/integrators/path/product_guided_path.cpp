@@ -1166,7 +1166,7 @@ void RadianceProxy::build_product_simd(
     if (m_product_is_built)
         return;
 
-    bsdf_proxy.finish_parameterization(outgoing, shading_normal);
+    bsdf_proxy.finish_parameterization(outgoing, shading_normal, true);
     m_product_is_built = true;
 
     const Vec8f inv_width(1.0f / ProxyWidth);
@@ -1273,7 +1273,7 @@ void RadianceProxy::build_product_simd(
     if (m_product_is_built)
         return;
 
-    bsdf_proxy.finish_parameterization(outgoing, shading_normal);
+    bsdf_proxy.finish_parameterization(outgoing, shading_normal, true);
     m_product_is_built = true;
 
     const Vec8f inv_width(1.0f / ProxyWidth);

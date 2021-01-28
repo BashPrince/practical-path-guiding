@@ -88,7 +88,8 @@ public:
 
     void finish_parameterization(
         const Vector3f &outgoing,
-        const Vector3f &shading_normal)
+        const Vector3f &shading_normal,
+        const bool init_simd = false)
     {
         m_is_diffuse = m_diffuse_weight > 0.0f;
         m_is_translucent = m_translucency_weight > 0.0f;
@@ -125,34 +126,37 @@ public:
         }
 
         // Init SIMD
-        m_normal_x = Vec8f(m_normal.x);
-        m_normal_y = Vec8f(m_normal.y);
-        m_normal_z = Vec8f(m_normal.z);
-        m_diffuse_weight_SIMD = Vec8f(m_diffuse_weight);
-
-        if (m_is_reflective)
+        if (init_simd)
         {
-            m_reflection_lobe_x = Vec8f(m_reflection_lobe.x);
-            m_reflection_lobe_y = Vec8f(m_reflection_lobe.y);
-            m_reflection_lobe_z = Vec8f(m_reflection_lobe.z);
-            m_reflection_weight_SIMD = Vec8f(m_reflection_weight);
-            m_reflection_roughness_SIMD = Vec8f(m_reflection_roughness);
-            m_cos_refl_n = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, m_normal_x, m_normal_y, m_normal_z);
-        }
+            m_normal_x = Vec8f(m_normal.x);
+            m_normal_y = Vec8f(m_normal.y);
+            m_normal_z = Vec8f(m_normal.z);
+            m_diffuse_weight_SIMD = Vec8f(m_diffuse_weight);
 
-        if (m_is_refractive)
-        {
-            m_refraction_lobe_x = Vec8f(m_refraction_lobe.x);
-            m_refraction_lobe_y = Vec8f(m_refraction_lobe.y);
-            m_refraction_lobe_z = Vec8f(m_refraction_lobe.z);
-            m_refraction_weight_SIMD = Vec8f(m_refraction_weight);
-            m_refraction_roughness_SIMD = Vec8f(m_refraction_roughness);
-            m_cos_refr_n = dot_simd(m_refraction_lobe_x, m_refraction_lobe_y, m_refraction_lobe_z, m_normal_x, m_normal_y, m_normal_z);
-        }
+            if (m_is_reflective)
+            {
+                m_reflection_lobe_x = Vec8f(m_reflection_lobe.x);
+                m_reflection_lobe_y = Vec8f(m_reflection_lobe.y);
+                m_reflection_lobe_z = Vec8f(m_reflection_lobe.z);
+                m_reflection_weight_SIMD = Vec8f(m_reflection_weight);
+                m_reflection_roughness_SIMD = Vec8f(m_reflection_roughness);
+                m_cos_refl_n = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, m_normal_x, m_normal_y, m_normal_z);
+            }
 
-        if (m_is_translucent)
-        {
-            m_translucency_weight_SIMD = Vec8f(m_translucency_weight);
+            if (m_is_refractive)
+            {
+                m_refraction_lobe_x = Vec8f(m_refraction_lobe.x);
+                m_refraction_lobe_y = Vec8f(m_refraction_lobe.y);
+                m_refraction_lobe_z = Vec8f(m_refraction_lobe.z);
+                m_refraction_weight_SIMD = Vec8f(m_refraction_weight);
+                m_refraction_roughness_SIMD = Vec8f(m_refraction_roughness);
+                m_cos_refr_n = dot_simd(m_refraction_lobe_x, m_refraction_lobe_y, m_refraction_lobe_z, m_normal_x, m_normal_y, m_normal_z);
+            }
+
+            if (m_is_translucent)
+            {
+                m_translucency_weight_SIMD = Vec8f(m_translucency_weight);
+            }
         }
     }
 
