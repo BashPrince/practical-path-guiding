@@ -38,7 +38,6 @@
 
 #include <mutex>
 
-#define BUILD_SIMD_PRODUCT
 #define PROXYWIDTH 32
 #define PRODUCTPROXYWIDTH 16
 
@@ -368,6 +367,13 @@ int FindInterval(int size, const Predicate &pred)
     return math::clamp(first - 1, 0, size - 2);
 }
 
+enum class EProductMethod {
+    EHierarchical,
+    EBsdf,
+    EProxy,
+    ETable
+};
+
 class RadianceProxy
 {
 public:
@@ -381,26 +387,29 @@ public:
         const float radiance_scale);
 
     void build_product(
+        const BSDF* bsdf,
+        const BSDFSamplingRecord& bRec,
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
         const Vector3f &shading_normal,
         const float* diffuse_proxy_table,
         const float* reflect_proxy_table,
-        const bool useProxyTable);
+        const EProductMethod productMethod);
 
-    void build_product_scalar(
-        BSDFProxy &bsdf_proxy,
+    void build_product_bsdf(
+        const BSDF* bsdf,
+        const BSDFSamplingRecord &bRec,
         const Vector3f &outgoing,
         const Vector3f &shading_normal);
 
-    void build_product_simd(
+    void build_product_table(
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
         const Vector3f &shading_normal,
         const float *diffuse_proxy_table,
         const float *reflect_proxy_table);
 
-    void build_product_simd(
+    void build_product_proxy(
         BSDFProxy &bsdf_proxy,
         const Vector3f &outgoing,
         const Vector3f &shading_normal);
@@ -428,38 +437,42 @@ public:
     class ImageImportanceSampler
     {
     public:
-        void build()
+        void build(const bool build_simd = true)
         {
+            this->is_build_simd = build_simd;
+
             // SIMD version
-#ifdef BUILD_SIMD_PRODUCT
-            float marginal_sum = 0.0f;
-            size_t start_index = (Width - 1) * Width;
-
-            for (size_t i = 0; i < Width; ++i)
+            if (is_build_simd)
             {
-                marginal_sum += distribution[start_index + i];
-                marginalDistribution[i] = marginal_sum;
+                float marginal_sum = 0.0f;
+                size_t start_index = (Width - 1) * Width;
+
+                for (size_t i = 0; i < Width; ++i)
+                {
+                    marginal_sum += distribution[start_index + i];
+                    marginalDistribution[i] = marginal_sum;
+                }
+
+                totalRadiance = marginalDistribution[Width - 1];
+                if (totalRadiance <= 0.0f)
+                    isZero = true;
             }
-
-            totalRadiance = marginalDistribution[Width - 1];
-            if (totalRadiance <= 0.0f)
-                isZero = true;
-#else
-
-            // Scalar version
-            float marginal_sum = 0.0f;
-            size_t start_index = Width - 1;
-
-            for (size_t i = 0; i < Width; ++i)
+            else
             {
-                marginal_sum += distribution[start_index + i * Width];
-                marginalDistribution[i] = marginal_sum;
-            }
+                // Scalar version
+                float marginal_sum = 0.0f;
+                size_t start_index = Width - 1;
 
-            totalRadiance = marginalDistribution[Width - 1];
-            if (totalRadiance <= 0.0f)
-                isZero = true;
-#endif
+                for (size_t i = 0; i < Width; ++i)
+                {
+                    marginal_sum += distribution[start_index + i * Width];
+                    marginalDistribution[i] = marginal_sum;
+                }
+
+                totalRadiance = marginalDistribution[Width - 1];
+                if (totalRadiance <= 0.0f)
+                    isZero = true;
+            }
         }
 
         void sample(const Point2 &s, Point2u &pixel) const
@@ -469,35 +482,42 @@ public:
                 pixel.x = (unsigned int)(s.x * Width);
                 pixel.y = (unsigned int)(s.y * Width);
             }
-#ifdef BUILD_SIMD_PRODUCT
-            const float s_x_scaled = s.x * totalRadiance;
-            size_t x = 0;
-            while (s_x_scaled > marginalDistribution[x])
-                ++x;
 
-            assert(x < Width);
+            if (is_build_simd)
+            {
+                const float s_x_scaled = s.x * totalRadiance;
+                size_t x = 0;
+                while (s_x_scaled > marginalDistribution[x])
+                    ++x;
 
-            size_t y = 0;
-            const float s_y_scaled = s.y * distribution[(Width - 1) * Width + x];
-            while (s_y_scaled > distribution[y * Width + x])
-                ++y;
-#else
-            const float s_y_scaled = s.y * totalRadiance;
-            size_t y = 0;
-            while (s_y_scaled > marginalDistribution[y])
-                ++y;
+                assert(x < Width);
 
-            assert(y < Width);
+                size_t y = 0;
+                const float s_y_scaled = s.y * distribution[(Width - 1) * Width + x];
+                while (s_y_scaled > distribution[y * Width + x])
+                    ++y;
+                    
+                pixel.x = x;
+                pixel.y = y;
+            }
+            else
+            {
+                const float s_y_scaled = s.y * totalRadiance;
+                size_t y = 0;
+                while (s_y_scaled > marginalDistribution[y])
+                    ++y;
 
-            size_t x = 0;
-            const size_t row_index = y * Width;
-            const float s_x_scaled = s.x * distribution[row_index + Width - 1];
-            while (s_x_scaled > distribution[row_index + x])
-                ++x;
-#endif
-            
-            pixel.x = x;
-            pixel.y = y;
+                assert(y < Width);
+
+                size_t x = 0;
+                const size_t row_index = y * Width;
+                const float s_x_scaled = s.x * distribution[row_index + Width - 1];
+                while (s_x_scaled > distribution[row_index + x])
+                    ++x;
+
+                pixel.x = x;
+                pixel.y = y;
+            }
         }
 
         float* get_distribution()
@@ -520,6 +540,7 @@ public:
         std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH> distribution;
         float totalRadiance;
         bool isZero = false;
+        bool is_build_simd;
     };
 
     ImageImportanceSampler<PRODUCTPROXYWIDTH> m_image_importance_sampler;
@@ -1094,25 +1115,46 @@ float cos_theta_to_boundary(const Point2u &p, const Point2u &dest, const float P
 }
 
 void RadianceProxy::build_product(
+    const BSDF* bsdf,
+    const BSDFSamplingRecord& bRec,
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
     const Vector3f &shading_normal,
     const float *diffuse_proxy_table,
     const float *reflect_proxy_table,
-    const bool useProxyTable)
+    const EProductMethod productMethod)
 {
-#ifdef BUILD_SIMD_PRODUCT
-    if (useProxyTable)
-        build_product_simd(bsdf_proxy, outgoing, shading_normal, diffuse_proxy_table, reflect_proxy_table);
-    else
-        build_product_simd(bsdf_proxy, outgoing, shading_normal);
-#else
-    build_product_scalar(bsdf_proxy, outgoing, shading_normal);
-#endif
+    switch (productMethod)
+    {
+    case EProductMethod::EBsdf:
+        build_product_bsdf(
+            bsdf,
+            bRec,
+            outgoing,
+            shading_normal);
+        break;
+    case EProductMethod::EProxy:
+        build_product_proxy(
+            bsdf_proxy,
+            outgoing,
+            shading_normal);
+        break;
+    case EProductMethod::ETable:
+        build_product_table(
+            bsdf_proxy,
+            outgoing,
+            shading_normal,
+            diffuse_proxy_table,
+            reflect_proxy_table);
+    
+    default:
+        break;
+    }
 }
 
-void RadianceProxy::build_product_scalar(
-    BSDFProxy& bsdf_proxy,
+void RadianceProxy::build_product_bsdf(
+    const BSDF* bsdf,
+    const BSDFSamplingRecord& bRec,
     const Vector3f& outgoing,
     const Vector3f& shading_normal)
 {
@@ -1121,10 +1163,9 @@ void RadianceProxy::build_product_scalar(
     if (m_product_is_built)
         return;
 
-    bsdf_proxy.finish_parameterization(outgoing, shading_normal);
-    m_product_is_built = true;
-
     float *distribution = m_image_importance_sampler.get_distribution();
+
+    BSDFSamplingRecord b = bRec;
 
     const float inv_width = 1.0f / ProxyWidth;
     for (size_t y = 0; y < ProxyWidth; ++y)
@@ -1135,26 +1176,24 @@ void RadianceProxy::build_product_scalar(
             const Point2u pixel(x, y);
             const size_t index = pixel.y * ProxyWidth + pixel.x;
             
-#ifdef LOAD_INCOMING_ARRAY
-            const Vector3f incoming(worldDir_scalar[3 * index], worldDir_scalar[3 * index + 1], worldDir_scalar[3 * index + 2]);
-#else
             const Point2f cylindrical_direction(
                 (x + 0.5f) * inv_width,
                 (y + 0.5f) * inv_width);
             const Vector3f incoming = canonicalToDir(cylindrical_direction);
-#endif
 
-            const float product = (*m_parent_map)[index] * bsdf_proxy.evaluate(incoming);
+            b.wo = b.its.toLocal(incoming);
+            const float product = (*m_parent_map)[index] * bsdf->eval(b).average();
             m_map[index] = product;
             distribution_sum += product;
             distribution[index] = distribution_sum;
         }
     }
     // Build discrete 2D distribution
-    m_image_importance_sampler.build();
+    m_image_importance_sampler.build(false);
+    m_product_is_built = true;
 }
 
-void RadianceProxy::build_product_simd(
+void RadianceProxy::build_product_table(
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
     const Vector3f &shading_normal,
@@ -1166,8 +1205,7 @@ void RadianceProxy::build_product_simd(
     if (m_product_is_built)
         return;
 
-    bsdf_proxy.finish_parameterization(outgoing, shading_normal, true);
-    m_product_is_built = true;
+    bsdf_proxy.finish_parameterization(outgoing, shading_normal, false);
 
     const Vec8f inv_width(1.0f / ProxyWidth);
     const Vec8i simd_loop_offsets(0, 1, 2, 3, 4, 5, 6, 7);
@@ -1261,9 +1299,10 @@ void RadianceProxy::build_product_simd(
     }
 
     m_image_importance_sampler.build();
+    m_product_is_built = true;
 }
 
-void RadianceProxy::build_product_simd(
+void RadianceProxy::build_product_proxy(
     BSDFProxy &bsdf_proxy,
     const Vector3f &outgoing,
     const Vector3f &shading_normal)
@@ -1274,7 +1313,6 @@ void RadianceProxy::build_product_simd(
         return;
 
     bsdf_proxy.finish_parameterization(outgoing, shading_normal, true);
-    m_product_is_built = true;
 
     const Vec8f inv_width(1.0f / ProxyWidth);
     const Vec8i simd_loop_offsets(0, 1, 2, 3, 4, 5, 6, 7);
@@ -1319,6 +1357,7 @@ void RadianceProxy::build_product_simd(
     }
 
     m_image_importance_sampler.build();
+    m_product_is_built = true;
 }
 
 void RadianceProxy::clear()
@@ -2455,18 +2494,21 @@ public:
 
         const std::string productMethod = props.getString("productSamplingMethod", "hierarchical");
 
-        if (productMethod == "hierarchical") {
-            m_useHierarchicalProduct = true;
+        if (productMethod == "bsdf")
+        {
+            m_productMethod = EProductMethod::EBsdf;
         }
-        else {
-            m_useHierarchicalProduct = false;
-
-            if (productMethod == "table") {
-                m_useProxyTable = true;
-            }
-            else {
-                m_useProxyTable = false;
-            }
+        else if (productMethod == "table")
+        {
+            m_productMethod = EProductMethod::ETable;
+        }
+        else if (productMethod == "proxy")
+        {
+            m_productMethod = EProductMethod::EProxy;
+        }
+        else
+        {
+            m_productMethod = EProductMethod::EHierarchical;
         }
     }
 
@@ -3045,10 +3087,9 @@ public:
         EGuidingMode &guidingMode,
         EGuidingMode& bounceMode,
         int& maxProductAwareBounces,
-        const bool useHierarchicalProduct,
         const float* diffuse_proxy_table,
         const float* reflect_proxy_table,
-        const bool useProxyTable) const
+        const EProductMethod productMethod) const
     {
         auto type = bsdf->getType();
         const bool canUseGuiding = m_isBuilt && dTree && (type & BSDF::EDelta) != (type & BSDF::EAll);
@@ -3075,10 +3116,10 @@ public:
 
                     if (useProductGuiding)
                     {
-                        if (useHierarchicalProduct)
+                        if (productMethod == EProductMethod::EHierarchical)
                             bsdfProxy.finish_parameterization(wiWorld, proxyNormal);
                         else
-                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, useProxyTable);
+                            radianceProxy.build_product(bsdf, bRec, bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, productMethod);
 
                         bsdfSamplingFraction = m_bsdfSamplingFraction;
                         productSamplingFraction = 1.0f;
@@ -3107,10 +3148,10 @@ public:
 
                     if (useProductGuiding)
                     {
-                        if (useHierarchicalProduct)
+                        if (productMethod == EProductMethod::EHierarchical)
                             bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), proxyNormal);
                         else
-                            radianceProxy.build_product(bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, useProxyTable);
+                            radianceProxy.build_product(bsdf, bRec, bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, productMethod);
 
                         --maxProductAwareBounces;
                     }
@@ -3171,7 +3212,7 @@ public:
         const float* const mip_map_diffuse,
         const float* const mip_map_reflect,
         const size_t mip_entries,
-        const bool useHierarchicalProduct) const{
+        const EProductMethod productMethod) const{
         Point2 sample = rRec.nextSample2D();
 
         // auto type = bsdf->getType();
@@ -3210,7 +3251,7 @@ public:
             // Product guiding
             if (sample.y < productSamplingFraction)
             {
-                if (useHierarchicalProduct)
+                if (productMethod == EProductMethod::EHierarchical)
                 {
                     Vector3f diffuse_lobe, translucency_lobe, reflectance_lobe, refraction_lobe;
                     bsdfProxy.get_lobes(diffuse_lobe, translucency_lobe, reflectance_lobe, refraction_lobe);
@@ -3263,7 +3304,7 @@ public:
             result = bsdf->eval(bRec);
         }
 
-        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bsdfProxy, mip_map_diffuse, mip_map_reflect, mip_entries, bRec, dTree, useHierarchicalProduct, sampledProduct, diffuse_mip_index, reflect_mip_index, refract_mip_index, useRefraction, flipRefraction, flipReflection);
+        pdfMat(woPdf, bsdfPdf, dTreePdf, productPdf, bsdfSamplingFraction, productSamplingFraction, bsdf, radianceProxy, bsdfProxy, mip_map_diffuse, mip_map_reflect, mip_entries, bRec, dTree, productMethod, sampledProduct, diffuse_mip_index, reflect_mip_index, refract_mip_index, useRefraction, flipRefraction, flipReflection);
         if (woPdf == 0) {
             return Spectrum{0.0f};
         }
@@ -3272,7 +3313,7 @@ public:
     }
 
     void pdfMat(Float &woPdf, Float &bsdfPdf, Float &dTreePdf, Float &productPdf, Float bsdfSamplingFraction, Float productSamplingFraction, const BSDF *bsdf, const RadianceProxy &radianceProxy, const BSDFProxy &bsdfProxy, const float *const mip_map_diffuse, const float *mip_map_reflect,
-                const size_t mip_entries, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree, const bool useHierarchicalProduct, const bool sampledProduct = false, const size_t diffuse_mip_index = 0, const size_t reflect_mip_index = 0, const size_t refract_mip_index = 0, const bool useRefraction = false, const bool flipRefraction = false, const bool flipReflection = false) const
+                const size_t mip_entries, const BSDFSamplingRecord &bRec, const DTreeWrapper *dTree, const EProductMethod productMethod, const bool sampledProduct = false, const size_t diffuse_mip_index = 0, const size_t reflect_mip_index = 0, const size_t refract_mip_index = 0, const bool useRefraction = false, const bool flipRefraction = false, const bool flipReflection = false) const
     {
         productPdf = dTreePdf = 0;
 
@@ -3298,7 +3339,7 @@ public:
         }
         else
         {
-            if (useHierarchicalProduct)
+            if (productMethod == EProductMethod::EHierarchical)
             {
                 if (!sampledProduct)
                 {
@@ -3634,10 +3675,9 @@ public:
                     guidingMode,
                     bounceMode,
                     maxProductAwareBounces,
-                    m_useHierarchicalProduct,
                     m_sdTree->get_proxy_table_diffuse_linear(),
                     m_sdTree->get_proxy_table_reflect_linear(),
-                    m_useProxyTable);
+                    m_productMethod);
 
                 Spectrum bsdfWeight = sampleMat(
                     bsdf,
@@ -3655,7 +3695,7 @@ public:
                     m_sdTree->get_proxy_table_diffuse(),
                     m_sdTree->get_proxy_table_reflect(),
                     m_sdTree->get_mip_entries(),
-                    m_useHierarchicalProduct);
+                    m_productMethod);
 
                 // Visualize RadianceProxy
                 // if (m_isFinalIter && dTree)
@@ -3754,7 +3794,7 @@ public:
                                     m_sdTree->get_mip_entries(),
                                     bRec,
                                     dTree,
-                                    m_useHierarchicalProduct);
+                                    m_productMethod);
                             }
 
                             /* Weight using the power heuristic */
@@ -4233,8 +4273,7 @@ private:
 
     EGuidingMode m_guidingMode = EGuidingMode::EProduct;
     int m_maxProductAwareBounces;
-    bool m_useHierarchicalProduct;
-    bool m_useProxyTable;
+    EProductMethod m_productMethod;
 
 public:
     MTS_DECLARE_CLASS()

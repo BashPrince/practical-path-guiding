@@ -277,7 +277,8 @@
     </param>
 	<param name="productSamplingMethod" readableName="Product sampling method" type="string" default="hierarchical" importance="1">
 	  Product sampling method. Use "hierarchical" for product sample warping, "table" for building a distribution
-	  using a precalculated bsdf proxy table, or "proxy" for building a distribution with bsdf proxy evaluations.
+	  using a precalculated bsdf proxy table, "proxy" for building a distribution with bsdf proxy evaluations
+	  or "bsdf" to build a distribution based on full BSDF evaluations.
     </param>
 	</plugin>
 
