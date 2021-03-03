@@ -535,8 +535,14 @@ public:
 	{
 		flipNormal = false;
 		const float alpha = m_alpha->eval(bRec.its).average();
-		bsdf_proxy.add_reflection_weight(m_specularReflectance->eval(bRec.its).average(), alpha);
-		bsdf_proxy.add_diffuse_weight(m_diffuseReflectance->eval(bRec.its).average() * INV_PI);
+		float specularFactor = 1 - m_externalRoughTransmittance->eval(Frame::cosTheta(bRec.wi), alpha);
+
+		/* Reallocate samples */
+		specularFactor = (specularFactor * m_specularSamplingWeight) /
+					   (specularFactor * m_specularSamplingWeight +
+						(1 - specularFactor) * (1 - m_specularSamplingWeight));
+		bsdf_proxy.add_reflection_weight(specularFactor * m_specularReflectance->eval(bRec.its).average(), alpha);
+		bsdf_proxy.add_diffuse_weight((1.0f - specularFactor) * m_diffuseReflectance->eval(bRec.its).average() * INV_PI);
 		return true;
 	}
 
