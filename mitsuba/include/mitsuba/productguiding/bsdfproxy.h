@@ -17,6 +17,7 @@ Vec8f One_Half_SIMD(0.5f);
 Vec8f PI_SIMD(M_PI);
 Vec8f Epsilon_SIMD(0.0001f);
 Vec8f Small_Cosine(0.02f);
+Vec8f Half_Cell(M_PI / 16.0f);
 
 inline Vector canonicalToDir(Point2 p)
 {
@@ -203,21 +204,20 @@ public:
     {
         Vec8f value(Zero_SIMD);
         const Vec8f cos_ni = dot_simd(m_normal_x, m_normal_y, m_normal_z, incoming_x, incoming_y, incoming_z);
-        const Vec8f cos_negni = -cos_ni;
 
         if (m_is_diffuse)
         {
-            value += m_diffuse_weight_SIMD * max(cos_ni, Zero_SIMD);
+            value += m_diffuse_weight_SIMD * select(cos_ni > -Half_Cell, max(cos_ni, Small_Cosine), Zero_SIMD);
         }
         if (m_is_translucent)
         {
-            value += m_translucency_weight_SIMD * max(cos_negni, Zero_SIMD);
+            value += m_translucency_weight_SIMD * select(cos_ni < Half_Cell, max(abs(cos_ni), Small_Cosine), Zero_SIMD);
         }
         if (m_is_reflective)
         {
             const Vec8f cos_refl_i = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, incoming_x, incoming_y, incoming_z);
 
-            value += select(cos_ni * m_cos_refl_n > Zero_SIMD,
+            value += select(cos_ni * m_cos_refl_n > Zero_SIMD || abs(cos_ni) < Half_Cell,
                             ggx_lobe_incoming_simd(
                                 select(cos_refl_i > Zero_SIMD, cos_refl_i, Small_Cosine),
                                 m_reflection_weight_SIMD,
@@ -228,7 +228,7 @@ public:
         {
             const Vec8f cos_refr_i = dot_simd(m_refraction_lobe_x, m_refraction_lobe_y, m_refraction_lobe_z, incoming_x, incoming_y, incoming_z);
 
-            value += select(cos_ni * m_cos_refr_n > Zero_SIMD,
+            value += select(cos_ni * m_cos_refr_n > Zero_SIMD || abs(cos_ni) < Half_Cell,
                             ggx_lobe_incoming_simd(
                                 select(cos_refr_i > Zero_SIMD, cos_refr_i, Small_Cosine),
                                 m_refraction_weight_SIMD,
