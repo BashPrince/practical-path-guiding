@@ -199,6 +199,267 @@ public:
         return a_x * b_x + a_y * b_y + a_z * b_z;
     }
 
+    inline bool intersect_great_arc_segment(
+        const Vector3f &vec,
+        const Vector3f &lobe,
+        const Vector3f &arc_from,
+        const Vector3f &arc_to,
+        Vector3f &intersection) const
+    {
+        const Vector3f p = cross(vec, lobe);
+        const Vector3f q = cross(arc_from, arc_to);
+        const Vector3f t = normalize(cross(p, q));
+
+        const float s1 = dot(cross(vec, p), t);
+        const float s2 = dot(cross(lobe, p), t);
+        const float s3 = dot(cross(arc_from, q), t);
+        const float s4 = dot(cross(arc_to, q), t);
+
+        if (-s1 > 0 && s2 > 0 && -s3 > 0 && s4 > 0) {
+            intersection = t;
+            return true;
+        }
+        else if (-s1 < 0 && s2 < 0 && -s3 < 0 && s4 < 0) {
+            intersection = -t;
+            return true;
+        }
+
+        return false;
+    }
+
+    inline bool intersect_arc_latitude(
+        const Vector3f &vec,
+        const Vector3f &lobe,
+        const Vector3f &arc_from,
+        const Vector3f &arc_to,
+        Vector3f &intersection) const
+    {
+        // Ray cone intersection
+        Vector3f d = lobe - vec;
+        const float tMax = d.length();
+        d = normalize(d);
+
+        float ox = vec.x, oy = vec.y, oz = vec.z;
+        float dx = d.x, dy = d.y, dz = d.z;
+        float height = arc_from.z;
+
+        if (height < 0.0f)
+        {
+            oz = -oz;
+            dz = -dz;
+        }
+
+        height = std::abs(height);
+        oz += height;
+
+        const float radius = Vector3f(arc_from.x, arc_from.y, 0.0f).length();
+        float k = radius / height;
+        k = k * k;
+        float a = dx * dx + dy * dy - k * dz * dz;
+        float b = 2 * (dx * ox + dy * oy - k * dz * (oz - height));
+        float c = ox * ox + oy * oy - k * (oz - height) * (oz - height);
+
+        // Solve quadratic equation for _t_ values
+        float t0, t1;
+        if (!solveQuadratic(a, b, c, t0, t1))
+            return false;
+
+        // Check quadric shape _t0_ and _t1_ for nearest intersection
+        if (t0 > tMax || t1 <= 0)
+            return false;
+
+        float tShapeHit = t0;
+        if (tShapeHit <= 0)
+        {
+            tShapeHit = t1;
+            if (tShapeHit > tMax)
+                return false;
+        }
+
+        intersection = normalize(vec + tShapeHit * d);
+
+        return true;
+    }
+
+    inline Vector3f move_vec_towards_lobe(
+        const Vector3f &vec,
+        const Vector3f &lobe,
+        const Vector3f &upper_left,
+        const Vector3f &upper_right,
+        const Vector3f &lower_left,
+        const Vector3f &lower_right) const
+    {
+        bool found_intersection = false;
+        Vector3f closest_intersection, next_intersection;
+
+        bool found_next_intersection = intersect_great_arc_segment(vec, lobe, upper_left, lower_left, next_intersection);
+        if (found_next_intersection && (!found_intersection || (next_intersection - vec).lengthSquared() < (closest_intersection - vec).lengthSquared())) {
+            found_intersection = true;
+            closest_intersection = next_intersection;
+        }
+
+        found_next_intersection = intersect_great_arc_segment(vec, lobe, upper_right, lower_right, next_intersection);
+        if (found_next_intersection && (!found_intersection || (next_intersection - vec).lengthSquared() < (closest_intersection - vec).lengthSquared())) {
+            found_intersection = true;
+            closest_intersection = next_intersection;
+        }
+
+        if ((upper_left - upper_right).lengthSquared() > 0.001f) {
+            if (std::abs(upper_left.z) < 0.01f) // equator = great circle
+            {
+                found_next_intersection = intersect_great_arc_segment(vec, lobe, upper_left, upper_right, next_intersection);
+                if (found_next_intersection && (!found_intersection || (next_intersection - vec).lengthSquared() < (closest_intersection - vec).lengthSquared()))
+                {
+                    found_intersection = true;
+                    closest_intersection = next_intersection;
+                }
+            }
+            else
+            {
+                found_next_intersection = intersect_arc_latitude(vec, lobe, upper_left, upper_right, next_intersection);
+                if (found_next_intersection && (!found_intersection || (next_intersection - vec).lengthSquared() < (closest_intersection - vec).lengthSquared()))
+                {
+                    found_intersection = true;
+                    closest_intersection = next_intersection;
+                }
+            }
+        }
+
+        if ((lower_left - lower_right).lengthSquared() > 0.001f) {
+            if (std::abs(lower_left.z) < 0.01f) // equator = great circle
+            {
+                found_next_intersection = intersect_great_arc_segment(vec, lobe, lower_left, lower_right, next_intersection);
+                if (found_next_intersection && (!found_intersection || (next_intersection - vec).lengthSquared() < (closest_intersection - vec).lengthSquared()))
+                {
+                    found_intersection = true;
+                    closest_intersection = next_intersection;
+                }
+            }
+            else
+            {
+                found_next_intersection = intersect_arc_latitude(vec, lobe, lower_left, lower_right, next_intersection);
+                if (found_next_intersection && (!found_intersection || (next_intersection - vec).lengthSquared() < (closest_intersection - vec).lengthSquared()))
+                {
+                    found_intersection = true;
+                    closest_intersection = next_intersection;
+                }
+            }
+        }
+
+        return found_intersection ? closest_intersection : lobe;
+    }
+
+    inline void move_vec_towards_lobe(
+        Vec8f &vec_x, Vec8f &vec_y, Vec8f &vec_z,
+        const Vec8f &cell_upper_left_x, const Vec8f &cell_upper_left_y, const Vec8f &cell_upper_left_z,
+        const Vec8f &cell_upper_right_x, const Vec8f &cell_upper_right_y, const Vec8f &cell_upper_right_z,
+        const Vec8f &cell_lower_left_x, const Vec8f &cell_lower_left_y, const Vec8f &cell_lower_left_z,
+        const Vec8f &cell_lower_right_x, const Vec8f &cell_lower_right_y, const Vec8f &cell_lower_right_z,
+        const Vector3f &lobe) const
+    {
+        for (size_t i = 0; i < Vec8f::size(); ++i) {
+            const Vector3f v(vec_x[i], vec_y[i], vec_z[i]);
+            const Vector3f upper_left(cell_upper_left_x[i], cell_upper_left_y[i], cell_upper_left_z[i]);
+            const Vector3f upper_right(cell_upper_right_x[i], cell_upper_right_y[i], cell_upper_right_z[i]);
+            const Vector3f lower_left(cell_lower_left_x[i], cell_lower_left_y[i], cell_lower_left_z[i]);
+            const Vector3f lower_right(cell_lower_right_x[i], cell_lower_right_y[i], cell_lower_right_z[i]);
+            const Vector3f v_moved = move_vec_towards_lobe(v, lobe, upper_left, upper_right, lower_left, lower_right);
+
+            // const Vector3f diff_lobe_v = lobe -v;
+            // const float old_distance = diff_lobe_v.length();
+            // const float new_distance = (lobe - v_moved).length();
+            // const float distance_moved = (v - v_moved).length();
+
+            // const Point2 old_cylindrical = dirToCanonical(v) * 16.0f;
+            // const Point2 new_cylindrical = dirToCanonical(v_moved + 0.01f * (v - v_moved)) * 16.0f;
+
+            // Point2i old_cell(old_cylindrical);
+            // Point2i new_cell(new_cylindrical);
+
+            // const Vector3f d = upper_left - lower_left;
+            // const float l = d.length();
+
+            // if (old_distance < new_distance || old_cell.x != new_cell.x || old_cell.y != new_cell.y)
+            // {
+            //     const Vector3f v_moved_local = move_vec_towards_lobe(v, lobe, upper_left, upper_right, lower_left, lower_right);
+            // }
+
+            vec_x.insert(i, v_moved.x);
+            vec_y.insert(i, v_moved.y);
+            vec_z.insert(i, v_moved.z);
+        }
+    }
+
+    inline Vec8f evaluate_simd_accurate(
+        const Vec8f &incoming_x, const Vec8f &incoming_y, const Vec8f &incoming_z,
+        const Vec8f &cell_upper_left_x, const Vec8f &cell_upper_left_y, const Vec8f &cell_upper_left_z,
+        const Vec8f &cell_upper_right_x, const Vec8f &cell_upper_right_y, const Vec8f &cell_upper_right_z,
+        const Vec8f &cell_lower_left_x, const Vec8f &cell_lower_left_y, const Vec8f &cell_lower_left_z,
+        const Vec8f &cell_lower_right_x, const Vec8f &cell_lower_right_y, const Vec8f &cell_lower_right_z) const
+    {
+        Vec8f value(Zero_SIMD);
+
+        if (m_is_diffuse)
+        {
+            Vec8f in_towards_n_x = incoming_x;
+            Vec8f in_towards_n_y = incoming_y;
+            Vec8f in_towards_n_z = incoming_z;
+            move_vec_towards_lobe(
+                in_towards_n_x, in_towards_n_y, in_towards_n_z,
+                cell_upper_left_x, cell_upper_left_y, cell_upper_left_z,
+                cell_upper_right_x, cell_upper_right_y, cell_upper_right_z,
+                cell_lower_left_x, cell_lower_left_y, cell_lower_left_z,
+                cell_lower_right_x, cell_lower_right_y, cell_lower_right_z,
+                m_normal);
+            const Vec8f cos_ni = dot_simd(m_normal_x, m_normal_y, m_normal_z, in_towards_n_x, in_towards_n_y, in_towards_n_z);
+            value += m_diffuse_weight_SIMD * select(cos_ni > Zero_SIMD, cos_ni, Zero_SIMD);
+        }
+        if (m_is_reflective)
+        {
+            Vec8f in_towards_refl_x = incoming_x;
+            Vec8f in_towards_refl_y = incoming_y;
+            Vec8f in_towards_refl_z = incoming_z;
+            move_vec_towards_lobe(
+                in_towards_refl_x, in_towards_refl_y, in_towards_refl_z,
+                cell_upper_left_x, cell_upper_left_y, cell_upper_left_z,
+                cell_upper_right_x, cell_upper_right_y, cell_upper_right_z,
+                cell_lower_left_x, cell_lower_left_y, cell_lower_left_z,
+                cell_lower_right_x, cell_lower_right_y, cell_lower_right_z,
+                m_reflection_lobe);
+            const Vec8f cos_refl_i = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, in_towards_refl_x, in_towards_refl_y, in_towards_refl_z);
+
+            value += select(dot_simd(in_towards_refl_x, in_towards_refl_y, in_towards_refl_z, m_normal_x, m_normal_y, m_normal_z) * m_cos_refl_n > Zero_SIMD,
+                            ggx_lobe_incoming_simd(
+                                select(cos_refl_i > Zero_SIMD, cos_refl_i, Small_Cosine),
+                                m_reflection_weight_SIMD,
+                                m_reflection_roughness_SIMD),
+                            Zero_SIMD);
+        }
+        if (m_is_refractive)
+        {
+            Vec8f in_towards_refr_x = incoming_x;
+            Vec8f in_towards_refr_y = incoming_y;
+            Vec8f in_towards_refr_z = incoming_z;
+            move_vec_towards_lobe(
+                in_towards_refr_x, in_towards_refr_y, in_towards_refr_z,
+                cell_upper_left_x, cell_upper_left_y, cell_upper_left_z,
+                cell_upper_right_x, cell_upper_right_y, cell_upper_right_z,
+                cell_lower_left_x, cell_lower_left_y, cell_lower_left_z,
+                cell_lower_right_x, cell_lower_right_y, cell_lower_right_z,
+                m_refraction_lobe);
+            const Vec8f cos_refr_i = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, in_towards_refr_x, in_towards_refr_y, in_towards_refr_z);
+
+            value += select(dot_simd(in_towards_refr_x, in_towards_refr_y, in_towards_refr_z, m_normal_x, m_normal_y, m_normal_z) * m_cos_refr_n > Zero_SIMD,
+                            ggx_lobe_incoming_simd(
+                                select(cos_refr_i > Zero_SIMD, cos_refr_i, Small_Cosine),
+                                m_refraction_weight_SIMD,
+                                m_refraction_roughness_SIMD),
+                            Zero_SIMD);
+        }
+
+        return value;
+    }
+
     inline Vec8f evaluate_simd(
         const Vec8f &incoming_x, const Vec8f &incoming_y, const Vec8f &incoming_z) const
     {
