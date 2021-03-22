@@ -3195,6 +3195,9 @@ public:
         auto type = bsdf->getType();
         const bool canUseGuiding = m_isBuilt && dTree && (type & BSDF::EDelta) != (type & BSDF::EAll);
 
+        if (maxProductAwareBounces > 0)
+            --maxProductAwareBounces;
+
         if (!canUseGuiding)
         {
             bsdfSamplingFraction = 1.0f;
@@ -3244,7 +3247,8 @@ public:
                 {
                     // Try Init product guiding
                     bool flipNormal;
-                    const bool useProductGuiding = radianceProxy.is_built() && bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
+                    const Vector wiWorld = bRec.its.toWorld(bRec.wi);
+                    const bool useProductGuiding = std::abs(dot(wiWorld, bRec.its.shFrame.n)) > 0.09 && radianceProxy.is_built() && bsdf->add_parameters_to_proxy(bsdfProxy, bRec, flipNormal);
                     const Vector proxyNormal = flipNormal ? -Vector(bRec.its.shFrame.n) : Vector(bRec.its.shFrame.n);
 
                     if (useProductGuiding)
@@ -3253,8 +3257,6 @@ public:
                             bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), proxyNormal);
                         else
                             radianceProxy.build_product(bsdf, bRec, bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, productMethod);
-
-                        --maxProductAwareBounces;
                     }
                     else // Path guiding
                     {
