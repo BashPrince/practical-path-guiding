@@ -478,9 +478,9 @@ public:
         {
             const Vec8f cos_refl_i = dot_simd(m_reflection_lobe_x, m_reflection_lobe_y, m_reflection_lobe_z, incoming_x, incoming_y, incoming_z);
 
-            value += select(cos_ni * m_cos_refl_n > Zero_SIMD || abs(cos_ni) < Half_Cell,
+            value += select((cos_ni * m_cos_refl_n > Zero_SIMD || abs(cos_ni) < Half_Cell) && cos_refl_i > -Half_Cell,
                             ggx_lobe_incoming_simd(
-                                select(cos_refl_i > Zero_SIMD, cos_refl_i, Small_Cosine),
+                                max(cos_refl_i, Small_Cosine),
                                 m_reflection_weight_SIMD,
                                 m_reflection_roughness_SIMD),
                             Zero_SIMD);
@@ -489,9 +489,9 @@ public:
         {
             const Vec8f cos_refr_i = dot_simd(m_refraction_lobe_x, m_refraction_lobe_y, m_refraction_lobe_z, incoming_x, incoming_y, incoming_z);
 
-            value += select(cos_ni * m_cos_refr_n > Zero_SIMD || abs(cos_ni) < Half_Cell,
+            value += select((cos_ni * m_cos_refr_n > Zero_SIMD || abs(cos_ni) < Half_Cell) && cos_refr_i > -Half_Cell,
                             ggx_lobe_incoming_simd(
-                                select(cos_refr_i > Zero_SIMD, cos_refr_i, Small_Cosine),
+                                max(cos_refr_i, Small_Cosine),
                                 m_refraction_weight_SIMD,
                                 m_refraction_roughness_SIMD),
                             Zero_SIMD);
