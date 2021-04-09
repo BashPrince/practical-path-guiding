@@ -395,7 +395,8 @@ public:
         const Vector3f &shading_normal,
         const float* diffuse_proxy_table,
         const float* reflect_proxy_table,
-        const EProductMethod productMethod);
+        const EProductMethod productMethod,
+        const std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH * 3>& incoming_directions);
 
     void build_product_bsdf(
         const BSDF* bsdf,
@@ -411,9 +412,10 @@ public:
         const float *reflect_proxy_table);
 
     void build_product_proxy(
-        BSDFProxy &bsdf_proxy,
-        const Vector3f &outgoing,
-        const Vector3f &shading_normal);
+        BSDFProxy& bsdf_proxy,
+        const Vector3f& outgoing,
+        const Vector3f& shading_normal,
+        const std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH * 3>& incoming_directions);
 
     void build_product_proxy_accurate(
         BSDFProxy &bsdf_proxy,
@@ -1123,12 +1125,13 @@ float cos_theta_to_boundary(const Point2u &p, const Point2u &dest, const float P
 void RadianceProxy::build_product(
     const BSDF* bsdf,
     const BSDFSamplingRecord& bRec,
-    BSDFProxy &bsdf_proxy,
-    const Vector3f &outgoing,
-    const Vector3f &shading_normal,
-    const float *diffuse_proxy_table,
-    const float *reflect_proxy_table,
-    const EProductMethod productMethod)
+    BSDFProxy& bsdf_proxy,
+    const Vector3f& outgoing,
+    const Vector3f& shading_normal,
+    const float* diffuse_proxy_table,
+    const float* reflect_proxy_table,
+    const EProductMethod productMethod,
+    const std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH * 3>& incoming_directions)
 {
     switch (productMethod)
     {
@@ -1143,7 +1146,8 @@ void RadianceProxy::build_product(
         build_product_proxy(
             bsdf_proxy,
             outgoing,
-            shading_normal);
+            shading_normal,
+            incoming_directions);
         break;
     case EProductMethod::EProxyAccurate:
         build_product_proxy_accurate(
@@ -1315,9 +1319,10 @@ void RadianceProxy::build_product_table(
 }
 
 void RadianceProxy::build_product_proxy(
-    BSDFProxy &bsdf_proxy,
-    const Vector3f &outgoing,
-    const Vector3f &shading_normal)
+    BSDFProxy& bsdf_proxy,
+    const Vector3f& outgoing,
+    const Vector3f& shading_normal,
+    const std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH * 3>& incoming_directions)
 {
     assert(m_is_built);
 
@@ -1345,9 +1350,14 @@ void RadianceProxy::build_product_proxy(
             const size_t index = y * ProxyWidth + x;
 
             Vec8f incoming_x, incoming_y, incoming_z;
-            const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
-            const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
-            canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
+            // const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
+            // const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
+            // canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
+
+            const size_t incoming_index = (y * ProxyWidth + x) * 3;
+            incoming_x.load(&incoming_directions[incoming_index]);
+            incoming_y.load(&incoming_directions[incoming_index + 8]);
+            incoming_z.load(&incoming_directions[incoming_index + 16]);
 
             const Vec8f bsdf_proxy_value = bsdf_proxy.evaluate_simd(incoming_x, incoming_y, incoming_z);
             Vec8f radiance;
@@ -2288,6 +2298,28 @@ public:
             p /= 2;
         }
 
+        const float inv_width = 1.0f / PRODUCTPROXYWIDTH;
+
+        for (size_t y = 0; y < PRODUCTPROXYWIDTH; ++y)
+        {
+            const Vec8i pixel_y(y);
+
+            for (size_t x = 0; x < PRODUCTPROXYWIDTH; x += 8)
+            {
+                const Vec8i pixel_x = Vec8i(x) + Vec8i(0, 1, 2, 3, 4, 5, 6, 7);
+
+
+                Vec8f incoming_x, incoming_y, incoming_z;
+                const Vec8f cylindrical_direction_x = (to_float(pixel_x) + Vec8f(0.5f)) * inv_width;
+                const Vec8f cylindrical_direction_y = (to_float(pixel_y) + Vec8f(0.5f)) * inv_width;
+                canonicalToDir_simd(cylindrical_direction_x, cylindrical_direction_y, incoming_x, incoming_y, incoming_z);
+                const size_t index = (y * PRODUCTPROXYWIDTH + x) * 3;
+                incoming_x.store(&m_incoming_directions[index]);
+                incoming_y.store(&m_incoming_directions[index + 8]);
+                incoming_z.store(&m_incoming_directions[index + 16]);
+            }
+        }
+
         const size_t array_size_diffuse = PROXYWIDTH * PROXYWIDTH * PixelOutWidth * PixelOutWidth * m_mip_entries;
         const size_t array_size_reflect = array_size_diffuse * alpha_steps;
 
@@ -2498,6 +2530,11 @@ public:
         return m_mip_entries;
     }
 
+    const std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH * 3>& get_incoming_directions() const
+    {
+        return m_incoming_directions;
+    }
+
 private:
     std::vector<STreeNode> m_nodes;
     AABB m_aabb;
@@ -2506,6 +2543,7 @@ private:
     std::vector<float> m_proxy_table_diffuse_linear;
     std::vector<float> m_proxy_table_reflect_linear;
     size_t m_mip_entries;
+    std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH * 3> m_incoming_directions;
 };
 
 
@@ -3181,16 +3219,17 @@ public:
         const BSDF *bsdf,
         const BSDFSamplingRecord &bRec,
         RadianceProxy &radianceProxy,
-        BSDFProxy& bsdfProxy,
+        BSDFProxy &bsdfProxy,
         const DTreeWrapper *dTree,
         Float &bsdfSamplingFraction,
         Float &productSamplingFraction,
         EGuidingMode &guidingMode,
-        EGuidingMode& bounceMode,
-        int& maxProductAwareBounces,
-        const float* diffuse_proxy_table,
-        const float* reflect_proxy_table,
-        const EProductMethod productMethod) const
+        EGuidingMode &bounceMode,
+        int &maxProductAwareBounces,
+        const float *diffuse_proxy_table,
+        const float *reflect_proxy_table,
+        const EProductMethod productMethod,
+        const std::array<float, PRODUCTPROXYWIDTH * PRODUCTPROXYWIDTH * 3>& incoming_directions) const
     {
         auto type = bsdf->getType();
         const bool canUseGuiding = m_isBuilt && dTree && (type & BSDF::EDelta) != (type & BSDF::EAll);
@@ -3203,6 +3242,7 @@ public:
             bsdfSamplingFraction = 1.0f;
             productSamplingFraction = 0.0f;
             bounceMode = EGuidingMode::ECombined;
+            guidingMode = m_guidingMode;
         }
         else
         {
@@ -3223,7 +3263,7 @@ public:
                         if (productMethod == EProductMethod::EHierarchical)
                             bsdfProxy.finish_parameterization(wiWorld, proxyNormal);
                         else
-                            radianceProxy.build_product(bsdf, bRec, bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, productMethod);
+                            radianceProxy.build_product(bsdf, bRec, bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, productMethod, incoming_directions);
 
                         bsdfSamplingFraction = m_bsdfSamplingFraction;
                         productSamplingFraction = 1.0f;
@@ -3256,7 +3296,7 @@ public:
                         if (productMethod == EProductMethod::EHierarchical)
                             bsdfProxy.finish_parameterization(bRec.its.toWorld(bRec.wi), proxyNormal);
                         else
-                            radianceProxy.build_product(bsdf, bRec, bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, productMethod);
+                            radianceProxy.build_product(bsdf, bRec, bsdfProxy, bRec.its.toWorld(bRec.wi), proxyNormal, diffuse_proxy_table, reflect_proxy_table, productMethod, incoming_directions);
                     }
                     else // Path guiding
                     {
@@ -3780,7 +3820,8 @@ public:
                     maxProductAwareBounces,
                     m_sdTree->get_proxy_table_diffuse_linear(),
                     m_sdTree->get_proxy_table_reflect_linear(),
-                    m_productMethod);
+                    m_productMethod,
+                    m_sdTree->get_incoming_directions());
 
                 Spectrum bsdfWeight = sampleMat(
                     bsdf,
